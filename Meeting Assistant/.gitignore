@@ -2,3 +2,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.tmp
+
+# Question banks hold personal answer scripts; keep them off GitHub
+banks/
