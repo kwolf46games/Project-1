@@ -1,0 +1,13 @@
+{
+  "active_banks": [
+    "question-bankv1",
+    "practice-question-bank-v1"
+  ],
+  "whisper_model": "base.en",
+  "match_threshold": 0.78,
+  "silence_seconds": 0.7,
+  "font_size": 12,
+  "opacity": 0.93,
+  "whisper_prompt": "BREAD",
+  "output_device": ""
+}
