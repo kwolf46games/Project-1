@@ -12,7 +12,10 @@ from typing import Callable
 
 import numpy as np
 
+import bank as b
 from bank import ROOT
+from transcript import (Transcript, Vocabulary, Word, align_words, clean_text, is_hallucination,
+                        looks_incomplete, mean_confidence)
 
 MODELS_DIR = ROOT / "models"
 TARGET_RATE = 16000
@@ -64,16 +67,21 @@ def _to_mono_16k(raw: bytes, channels: int, rate: int) -> np.ndarray:
 class Listener:
     """Background thread: loopback audio -> energy-based segmentation -> faster-whisper."""
 
-    def __init__(self, cfg: dict, on_text: Callable[[str], None], on_status: Callable[[str], None]):
+    def __init__(self, cfg: dict, on_text: Callable[[str], None], on_status: Callable[[str], None],
+                 on_transcript: Callable[[Transcript], None] | None = None):
         self.cfg = cfg
         self.on_text = on_text
         self.on_status = on_status
+        self.on_transcript = on_transcript  # optional: also receives word confidences and corrections
         self.paused = threading.Event()
         self._stop = threading.Event()
         self._chunks: queue.Queue[np.ndarray] = queue.Queue()
         self._thread: threading.Thread | None = None
         self.model = None
         self.device_name = ""
+        self._vocab = Vocabulary()
+        self._vocab_sig: tuple | None = None
+        self._held: tuple[np.ndarray, Transcript, float] | None = None  # cut-off utterance waiting for its rest
 
     # ----- lifecycle -----
     def start(self) -> None:
@@ -90,6 +98,7 @@ class Listener:
             self._thread.join(timeout=3)
         self._stop.clear()
         self._chunks = queue.Queue()
+        self._held = None
         self.start()
 
     def load_model(self) -> None:
@@ -101,6 +110,30 @@ class Listener:
         MODELS_DIR.mkdir(exist_ok=True)
         self.model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=8,
                                   download_root=str(MODELS_DIR))
+
+    # ----- vocabulary -----
+    def _bank_signature(self) -> tuple:
+        sig = []
+        for name in self.cfg.get("active_banks", []):
+            try:
+                sig.append((name, (b.BANKS_DIR / f"{name}.md").stat().st_mtime_ns))
+            except OSError:
+                sig.append((name, 0))
+        return tuple(sig)
+
+    def refresh_vocabulary(self) -> None:
+        """Rebuild the name/jargon list from the active banks whenever they change on disk."""
+        if not self.cfg.get("use_vocabulary", True):
+            self._vocab = Vocabulary()
+            return
+        sig = self._bank_signature()
+        if sig == self._vocab_sig:
+            return
+        try:
+            self._vocab = Vocabulary.from_entries(b.active_entries(self.cfg))
+            self._vocab_sig = sig
+        except Exception:  # noqa: BLE001 - a half-saved bank must not stop listening; keep the old list
+            pass
 
     # ----- worker -----
     def _run(self) -> None:
@@ -170,7 +203,7 @@ class Listener:
                     pre_roll = (pre_roll + [frame])[-10:]
 
             if self.paused.is_set():
-                speech, pre_roll = [], []
+                speech, pre_roll, self._held = [], [], None
                 continue
 
             dur = len(speech) * FRAME_SEC
@@ -178,15 +211,65 @@ class Listener:
             if ended or dur >= MAX_UTTERANCE_SEC:
                 audio = np.concatenate(speech)
                 speech, pre_roll = [], []
-                if dur >= MIN_UTTERANCE_SEC:
-                    self._transcribe(audio)
+                if dur >= MIN_UTTERANCE_SEC or self._held is not None:
+                    self._finish(audio)
+            self._release_held(bool(speech))
 
-    def _transcribe(self, audio: np.ndarray) -> None:
-        segments, _ = self.model.transcribe(
-            audio, language="en", beam_size=1, vad_filter=True,
-            condition_on_previous_text=False, without_timestamps=True,
-            initial_prompt=self.cfg.get("whisper_prompt") or None,
-        )
-        text = " ".join(s.text.strip() for s in segments).strip()
-        if text:
-            self.on_text(text)
+    def _finish(self, audio: np.ndarray) -> None:
+        """An utterance ended. Transcribe it (joined to an earlier cut-off piece, if any). If it still stops
+        mid-sentence, hold it briefly: people pause to think mid-question, and half a question matches nothing."""
+        held, self._held = self._held, None
+        if held is not None:
+            audio = np.concatenate([held[0], np.zeros(int(TARGET_RATE * 0.2), dtype=np.float32), audio])
+        tr = self._transcribe(audio)
+        if tr is None:
+            if held is not None:
+                self._emit(held[1])
+            return
+        hold = float(self.cfg.get("continuation_seconds", 1.5))
+        if tr.incomplete and hold > 0 and len(audio) / TARGET_RATE < MAX_UTTERANCE_SEC - 5:
+            self._held = (audio, tr, time.monotonic() + hold)
+        else:
+            self._emit(tr)
+
+    def _release_held(self, speech_active: bool, now: float | None = None) -> None:
+        """Give up waiting for the rest of a cut-off utterance and use what we have."""
+        now = time.monotonic() if now is None else now
+        if self._held is not None and not speech_active and now >= self._held[2]:
+            tr, self._held = self._held[1], None
+            self._emit(tr)
+
+    def _emit(self, tr: Transcript) -> None:
+        if self.on_transcript:
+            self.on_transcript(tr)
+        self.on_text(tr.text)
+
+    def _prompt(self) -> str | None:
+        return self._vocab.prompt(self.cfg.get("whisper_prompt") or "") or None
+
+    def _transcribe(self, audio: np.ndarray) -> Transcript | None:
+        self.refresh_vocabulary()
+        opts = dict(language="en", beam_size=int(self.cfg.get("beam_size", 5)), vad_filter=True,
+                    condition_on_previous_text=False, initial_prompt=self._prompt())
+        if self.cfg.get("word_confidence", True):
+            opts["word_timestamps"] = True  # per-word confidence: lets us repair only what the model was unsure of
+        else:
+            opts["without_timestamps"] = True
+        segments, _ = self.model.transcribe(audio, **opts)
+        segs = list(segments)
+        raw = " ".join(s.text.strip() for s in segs).strip()
+        if not raw:
+            return None
+        heard = [Word(w.word.strip(), w.start, w.end, w.probability)
+                 for s in segs for w in (getattr(s, "words", None) or []) if w.word.strip()]
+        text = clean_text(raw)
+        words = align_words(text, heard) if heard else [Word(t) for t in text.split()]
+        duration = len(audio) / TARGET_RATE
+        logprobs = [s.avg_logprob for s in segs if hasattr(s, "avg_logprob")]
+        if is_hallucination(text, duration, mean_confidence(words),
+                            max((getattr(s, "no_speech_prob", 0.0) for s in segs), default=0.0),
+                            sum(logprobs) / len(logprobs) if logprobs else 0.0):
+            return None
+        words, fixes = self._vocab.correct(words)
+        text = " ".join(w.text for w in words)
+        return Transcript(text, raw, words, mean_confidence(words), duration, looks_incomplete(text), fixes)

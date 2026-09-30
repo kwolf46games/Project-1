@@ -2,9 +2,14 @@
 
 File format (hand-editable):
 
-   ptimize the software to be able to identify follow up questions when asked to. As well as better matching for audio to transcript and suggested extra phrasing for each question. It is in my projects folder, meeting assistant.
+   # Bank title                          (optional)
 
- I am making this to help individuals that are deaf, be able to respond better during virtual meetings
+   ## The question as it might be asked
+   also: another wording | and another   (optional, "|"-separated)
+   tags: behavioral, leadership          (optional, comma-separated)
+   skeleton: one-line outline            (optional)
+
+   The response text...
 
 Everything after the metadata lines is the response body.
 """
@@ -27,6 +32,14 @@ DEFAULT_CONFIG = {
     "silence_seconds": 0.7,
     "font_size": 13,
     "opacity": 0.93,
+    # transcription
+    "beam_size": 5,                # speech-model search width: 1 is fastest, 5 is noticeably more accurate
+    "word_confidence": True,       # per-word confidence, used to repair names the model misheard
+    "use_vocabulary": True,        # prime the speech model with names/terms from the active banks
+    "continuation_seconds": 1.5,   # wait this long for the rest of a question that stops mid-sentence (0 = off)
+    # follow-ups ("followup_threshold" may also be set; it defaults to match_threshold)
+    "followups": True,
+    "followup_window_seconds": 240,  # how long an answer stays "the one being discussed"
 }
 
 META_KEYS = ("also", "tags", "skeleton")
@@ -141,8 +154,17 @@ def _looks_like_question(text: str) -> bool:
     return t.endswith("?") or t.startswith(QUESTION_WORDS)
 
 
+TODO_SUFFIX = re.compile(r"\s+(?:FIX\w*|TODO|TBD)\s*$", re.I)
+
+
 def _clean_question(text: str) -> str:
-    return NUMBER_PREFIX.sub("", text.strip().strip("*")).strip()
+    return TODO_SUFFIX.sub("", NUMBER_PREFIX.sub("", text.strip().strip("*")).strip()).strip()
+
+
+def _is_numbered_question(text: str) -> bool:
+    """'Q12 What is your biggest weakness?' / 'B3. Tell me about...': numbered, so it is its own entry
+    even when its heading sits one level below the previous question's."""
+    return bool(re.match(r"^\s*[QB]\d+\b", text, re.I)) and _looks_like_question(text)
 
 
 def _rows_to_bank(rows: list[list[str]], name: str) -> Bank:
@@ -216,10 +238,11 @@ def _blocks_to_bank(blocks: list[tuple[int | None, str]], name: str) -> Bank:
         only_questions = counts[best] >= 3  # skip section headings like "Fast facts"
         q, body = None, []
         for lvl, t in blocks:
-            if lvl and lvl <= best:
+            numbered = bool(lvl) and lvl > best and _is_numbered_question(t)
+            if lvl and (lvl <= best or numbered):
                 if q:
                     add(q, body)
-                keep = lvl == best and (not only_questions or _looks_like_question(t))
+                keep = (lvl == best or numbered) and (not only_questions or _looks_like_question(t))
                 q, body = (t, []) if keep else (None, [])
             elif q is not None:
                 body.append(f"**{t}**" if lvl else t)

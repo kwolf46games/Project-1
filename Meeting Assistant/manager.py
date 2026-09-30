@@ -473,6 +473,7 @@ class QuestionEditor:
         self.q = entry_box(entry.question)
         label("Other ways it might be asked", "one per line; more = better matching")
         self.also = text_box("\n".join(entry.also), 4)
+        mgr._btn(body, "Suggest wordings", self.suggest).pack(anchor="w", pady=(4, 0))
         label("Response", "**bold** = line to land · {{text}} = placeholder to fix")
         self.resp = text_box(entry.response, 12, expand=True)
         label("Skeleton", "optional one-line outline shown above the answer")
@@ -487,6 +488,47 @@ class QuestionEditor:
         d.bind("<Control-s>", lambda e: self.save())
         d.bind("<Escape>", lambda e: d.destroy())
         self.q.focus_set()
+
+    def suggest(self) -> None:
+        """Offer reworded versions of the question to add under 'Other ways it might be asked'."""
+        from suggest import suggest_phrasings
+        q = self.q.get().strip()
+        if not q:
+            messagebox.showinfo("Suggest wordings", "Type the question first.", parent=self.dlg)
+            return
+        have = [line.strip() for line in self.also.get("1.0", "end").splitlines() if line.strip()]
+        found = suggest_phrasings(q, have, n=8)
+        if not found:
+            messagebox.showinfo("Suggest wordings", "No new wordings to suggest. This one is well covered.",
+                                parent=self.dlg)
+            return
+        mgr = self.mgr
+        dlg = tk.Toplevel(self.dlg)
+        dlg.title("Suggested wordings")
+        dlg.configure(bg=BG)
+        dlg.transient(self.dlg)
+        dlg.grab_set()
+        tk.Label(dlg, text="Keep the ones an interviewer might really say:", bg=BG, fg=FG, font=mgr.fb).pack(
+            anchor="w", padx=12, pady=(12, 6))
+        lb = tk.Listbox(dlg, selectmode="extended", bg=PANEL, fg=FG, selectbackground=SELECT_BG, relief="flat",
+                        font=mgr.f, height=min(10, len(found)), width=64, activestyle="none", exportselection=False)
+        for s in found:
+            lb.insert("end", s.text)
+        lb.selection_set(0, "end")
+        lb.pack(fill="both", expand=True, padx=12)
+
+        def add() -> None:
+            picked = [found[i].text for i in lb.curselection()]
+            if picked:
+                current = self.also.get("1.0", "end").strip()
+                self.also.delete("1.0", "end")
+                self.also.insert("1.0", "\n".join(([current] if current else []) + picked))
+            dlg.destroy()
+        row = tk.Frame(dlg, bg=BG)
+        row.pack(fill="x", padx=12, pady=12)
+        mgr._btn(row, "Add selected", add, True).pack(side="right")
+        mgr._btn(row, "Cancel", dlg.destroy).pack(side="right", padx=6)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     def save(self) -> None:
         q = self.q.get().strip()
