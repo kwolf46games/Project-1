@@ -7,6 +7,8 @@ The overlay feeds each transcribed utterance to Session.hear() and shows what co
     elif heard.kind == "followup":  show heard.followup.prepared (if any) or heard.followup.focus,
                                     with heard.followup.anchor as the answer being probed
     elif heard.kind == "unmatched": show heard.matches as "did you mean…" candidates
+
+and calls session.set_anchor(entry) whenever the person picks an answer by hand.
 """
 from __future__ import annotations
 
@@ -17,8 +19,9 @@ from typing import Callable
 from bank import Entry, load_config
 from followup import PreparedFollowup, Signal, detect, focus_passages, prepared_followups
 from matcher import Match, Matcher, looks_like_question
-from transcript import clean_text
+from transcript import clean_text, looks_incomplete
 
+STRONG_MARGIN = 0.06       # a match this far over the threshold counts even if it doesn't sound like a question
 ANCHOR_BONUS = 0.06        # extra credit for a follow-up written under the answer being discussed
 AMBIGUOUS_MARGIN = 0.04    # a cue-flagged follow-up only loses to a bank match that clears the threshold by this much
 WORDY_MATCH = 0.85         # ...and only when the heard words really are that bank question's words
@@ -62,6 +65,10 @@ class Session:
     def reset(self) -> None:
         self._anchor, self._anchor_at = None, 0.0
 
+    def set_anchor(self, entry: Entry | None, now: float | None = None) -> None:
+        """Make `entry` the answer under discussion, e.g. when the person picks one by hand."""
+        self._anchor, self._anchor_at = entry, self._clock() if now is None else now
+
     def live_anchor(self, now: float | None = None) -> Entry | None:
         """The answer under discussion, or None once it has gone stale."""
         now = self._clock() if now is None else now
@@ -74,8 +81,9 @@ class Session:
         thr = float(self.cfg.get("match_threshold", 0.78))
         matches = self.matcher.match(text, k=3)
         top = matches[0] if matches else None
-        primary = top if top and top.score >= thr else None
         is_q = looks_like_question(text)
+        strong = float(self.cfg.get("strong_margin", STRONG_MARGIN))
+        primary = top if top and (top.score >= thr + strong or (top.score >= thr and is_q)) else None
         anchor = self.live_anchor(now)
 
         hit = self._followup(text, anchor, primary, top, thr) if self.cfg.get("followups", True) else None
@@ -100,10 +108,15 @@ class Session:
         fms = self.matcher.match_followups(text, k=10_000)
         anchor_key = _key(anchor)
 
-        def eff(m) -> float:
-            return m.score + (ANCHOR_BONUS if _key(m.entry) == anchor_key else 0.0)
+        # a fragment that stops mid-sentence ("Can you tell me about the") gets no head start and a higher bar:
+        # guessing wrong is worse than waiting for the rest
+        cut_off = looks_incomplete(text)
+        bonus = 0.0 if cut_off else ANCHOR_BONUS
 
-        fu_thr = float(self.cfg.get("followup_threshold", thr))
+        def eff(m) -> float:
+            return m.score + (bonus if _key(m.entry) == anchor_key else 0.0)
+
+        fu_thr = float(self.cfg.get("followup_threshold", thr)) + (STRONG_MARGIN if cut_off else 0.0)
         best = max(fms, key=eff, default=None)
         # 1. a follow-up you prepared: it beats a bank question unless that question matches even better
         if best and eff(best) >= fu_thr and eff(best) >= (primary.score if primary else 0.0):

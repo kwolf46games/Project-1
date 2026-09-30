@@ -108,7 +108,7 @@ def test_reset_and_reload_do_not_lose_track(session, matcher, entries):
 
 def test_a_followup_under_the_current_answer_gets_a_head_start(matcher):
     """A prepared follow-up that only just misses the threshold is accepted when its answer is on the table."""
-    text = "how large was the team then"
+    text = "how large was your team"
     score = matcher.match_followups(text, k=1)[0].score
     cfg = {"match_threshold": 0.99, "followup_threshold": score + 0.03, "followups": True}   # bonus is 0.06
     cold = Session(matcher, dict(cfg))
@@ -127,3 +127,21 @@ def test_a_better_bank_question_beats_a_similar_prepared_followup(entries):
     s.hear(LED)
     h = s.hear("How big was the team at your last job?")
     assert h.kind == "new" and h.primary.entry.question == "How big was the team at your last job?"
+
+
+def test_a_cut_off_fragment_is_not_taken_for_a_followup(session):
+    session.hear(LED)
+    assert session.hear("Can you tell me about the").kind != "followup"         # wait for the rest
+    assert session.hear("Can you tell me about the rollback plan?").kind == "followup"
+    assert session.hear("Tell me more about that").kind == "followup"            # cut-off-looking, but unmistakable
+
+
+def test_a_weak_match_only_counts_if_it_sounds_like_a_question(matcher):
+    statement, question = "a time you led a team", "a time you led a team?"
+    scores = [matcher.match(t, k=1)[0].score for t in (statement, question)]
+    thr = min(scores) - 0.01
+    assert max(scores) < thr + 0.06                      # both sit between the threshold and the "strong" line
+    s = Session(matcher, {"match_threshold": thr, "followups": False})
+    h = s.hear(statement)
+    assert h.kind == "statement" and h.primary is None and s.live_anchor() is None
+    assert s.hear(question).kind == "new"
