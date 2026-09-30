@@ -1,2 +1,2 @@
 @echo off
-start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0app.py" run
+"%~dp0.venv\Scripts\python.exe" "%~dp0app.py" %*
