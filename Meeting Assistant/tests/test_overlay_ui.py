@@ -70,7 +70,8 @@ def ov(banks_dir, monkeypatch):
         b.Entry("What is your biggest weakness?", "WEAK answer", bank="demo"),
     ])
     bk.save()
-    b.CONFIG_PATH.write_text(json.dumps({"active_banks": ["demo"], "match_threshold": 0.78}), encoding="utf-8")
+    b.CONFIG_PATH.write_text(json.dumps({"active_banks": ["demo"], "match_threshold": 0.78, "generate": False}),
+                             encoding="utf-8")
     monkeypatch.setattr(overlay, "Listener", FakeListener)
     monkeypatch.setattr(overlay, "Matcher", lambda: Matcher(embed_fn=fake_embed))
     o = overlay.Overlay()

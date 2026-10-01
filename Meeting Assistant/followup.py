@@ -224,6 +224,11 @@ class Conversation:
                 out.append(e)
         return out[:3]
 
+    def recent(self, limit: int = 2) -> list[Entry]:
+        """The answers shown lately (within the follow-up window), newest first."""
+        with self._lock:
+            return self._recent_entries(self.clock())[:limit]
+
     def reset(self) -> None:
         with self._lock:
             self._recent.clear()

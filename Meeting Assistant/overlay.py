@@ -27,7 +27,8 @@ from tkinter import font as tkfont
 import bank as bankmod
 from audio import Heard, Listener
 from followup import STRONG_MARGIN, Conversation, Decision
-from matcher import Match, Matcher, bank_vocabulary
+from generate import Generator, build_request
+from matcher import Match, Matcher, bank_vocabulary, looks_like_question
 from theme import ACCENT, BAD, BG, FG, GOOD, HOVER_BG, MUTED, PANEL, PLACEHOLDER_BG, WARN, enable_dpi_awareness
 
 FOLLOW_ARM_SEC = 20  # how long the "↳ Follow-up" button stays armed
@@ -46,6 +47,24 @@ class Overlay:
         self._unsure_text = ""                # what was heard when we weren't sure (for "Remember this wording")
         self.matcher_error = ""               # why matching is unavailable (shown instead of "Listening")
         self._timers: list[str] = []
+        # drafted ("generated") answer shown beside the prepared one
+        self.gen: Generator | None = None
+        self.view = "prepared"                # which answer the right pane shows: "prepared" | "generated"
+        self._prepared_md = ""
+        self.gen_text = ""
+        self.gen_state = "idle"               # idle | drafting | done | error | off
+        self.gen_note = ""
+        self.gen_summary = ""
+        self.gen_seconds = 0.0
+        self.gen_truncated = False
+        self._gen_floor = 0                   # events from jobs up to this id are stale
+        self._gen_job = 0
+        self._gen_seen = 0
+        self._last_req = None
+        self._pinned_prepared = False         # the user chose "Prepared" while a draft was streaming
+        self._render_pending = False
+        self._gen_warned = ""
+
         self._reload_lock = threading.Lock()
 
         enable_dpi_awareness()
@@ -55,9 +74,9 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", float(self.cfg["opacity"]))
         self.scale = self.root.winfo_fpixels("1i") / 96.0
-        w, h = int(560 * self.scale), int(760 * self.scale)
+        w, h = int(900 * self.scale), int(760 * self.scale)
         self.root.geometry(f"{w}x{h}+{self.root.winfo_screenwidth() - w - 24}+40")
-        self.root.minsize(int(380 * self.scale), int(420 * self.scale))
+        self.root.minsize(int(560 * self.scale), int(420 * self.scale))
 
         self.base = tkfont.Font(family="Segoe UI", size=self.cfg["font_size"])
         self.bold = tkfont.Font(family="Segoe UI", size=self.cfg["font_size"], weight="bold")
@@ -65,6 +84,10 @@ class Overlay:
         self.title_f = tkfont.Font(family="Segoe UI Semibold", size=self.cfg["font_size"] + 2)
 
         self._build()
+        self.gen = Generator(self.cfg, lambda job, kind, data: self.events.put(("gen", (job, kind, data))))
+        if self.gen.status()[0]:
+            self.gen.warm()
+        self._refresh_gen_ui()
         self.listener = Listener(self.cfg, self.heard_q.put, lambda s: self.events.put(("status", s)))
         self._reload_banks()
         self._match_thread = threading.Thread(target=self._match_loop, daemon=True)
@@ -108,29 +131,8 @@ class Overlay:
         self.pause_btn.pack(side="right", padx=2)
         self.follow_btn = self._btn(top, "↳ Follow-up", self._toggle_follow)
         self.follow_btn.pack(side="right", padx=2)
-
-        self.heard = tk.Label(self.root, text="Heard: —", fg=MUTED, bg=BG, font=self.small,
-                              anchor="w", justify="left", wraplength=520)
-        self.heard.pack(fill="x", padx=12)
-
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=12, pady=(8, 2))
-        self.conf = tk.Label(head, text="", fg=BG, bg=MUTED, font=self.small, padx=6)
-        self.conf.pack(side="right", anchor="n")
-        self.question = tk.Label(head, text="Waiting for a question…", fg=FG, bg=BG, font=self.title_f,
-                                 anchor="w", justify="left", wraplength=450)
-        self.question.pack(side="left", fill="x", expand=True)
-
-        self.notes = tk.Frame(self.root, bg=BG)   # follow-up banner + hint; takes no room while empty
-        self.notes.pack(fill="x", padx=12)
-        self.banner = tk.Label(self.notes, text="", fg=WARN, bg=BG, font=self.small, anchor="w",
-                               justify="left", wraplength=520)
-        self.hint = tk.Label(self.notes, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
-                             justify="left", wraplength=520)
-
-        self.skeleton = tk.Label(self.root, text="", fg=ACCENT, bg=BG, font=self.small, anchor="w",
-                                 justify="left", wraplength=520)
-        self.skeleton.pack(fill="x", padx=12, pady=(0, 6))
+        self.gen_btn = self._btn(top, "✨ Draft: on", self._toggle_gen)
+        self.gen_btn.pack(side="right", padx=2)
 
         search = tk.Frame(self.root, bg=BG)
         search.pack(side="bottom", fill="x", padx=10, pady=(2, 10))
@@ -142,8 +144,56 @@ class Overlay:
         self.likely = tk.Frame(self.root, bg=BG)
         self.likely.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
 
-        body = tk.Frame(self.root, bg=PANEL)
-        body.pack(fill="both", expand=True, padx=10)
+        # two panes: what was asked (left) beside the answer (right); drag the divider to taste
+        self.paned = tk.PanedWindow(self.root, orient="horizontal", bg=BG, bd=0, sashwidth=int(6 * self.scale),
+                                    sashrelief="flat", opaqueresize=True)
+        self.paned.pack(fill="both", expand=True, padx=10)
+        self.left = tk.Frame(self.paned, bg=BG)
+        self.right = tk.Frame(self.paned, bg=BG)
+        self.paned.add(self.left, minsize=int(220 * self.scale), width=int(320 * self.scale), stretch="never")
+        self.paned.add(self.right, minsize=int(300 * self.scale), stretch="always")
+
+        tk.Label(self.left, text="THEY ASKED", fg=MUTED, bg=BG, font=self.small, anchor="w").pack(fill="x", padx=(2, 8))
+        self.heard = tk.Label(self.left, text="Heard: —", fg=FG, bg=BG, font=self.title_f,
+                              anchor="nw", justify="left", wraplength=280)
+        self.heard.pack(fill="x", padx=(2, 8), pady=(2, 10))
+
+        tk.Label(self.left, text="CLOSEST PREPARED QUESTION", fg=MUTED, bg=BG, font=self.small, anchor="w").pack(
+            fill="x", padx=(2, 8))
+        head = tk.Frame(self.left, bg=BG)
+        head.pack(fill="x", padx=(2, 8), pady=(2, 2))
+        self.conf = tk.Label(head, text="", fg=BG, bg=MUTED, font=self.small, padx=6)
+        self.conf.pack(side="right", anchor="n")
+        self.question = tk.Label(head, text="Waiting for a question…", fg=FG, bg=BG, font=self.bold,
+                                 anchor="w", justify="left", wraplength=220)
+        self.question.pack(side="left", fill="x", expand=True)
+
+        self.notes = tk.Frame(self.left, bg=BG)   # follow-up banner + hint; takes no room while empty
+        self.notes.pack(fill="x", padx=(2, 8))
+        self.banner = tk.Label(self.notes, text="", fg=WARN, bg=BG, font=self.small, anchor="w",
+                               justify="left", wraplength=280)
+        self.hint = tk.Label(self.notes, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
+                             justify="left", wraplength=280)
+
+        self.skeleton = tk.Label(self.left, text="", fg=ACCENT, bg=BG, font=self.small, anchor="w",
+                                 justify="left", wraplength=280)
+        self.skeleton.pack(fill="x", padx=(2, 8), pady=(0, 6))
+
+        bar = tk.Frame(self.right, bg=BG)
+        bar.pack(fill="x", pady=(0, 4))
+        self.tab_gen = self._btn(bar, "✨ Generated", lambda: self._set_view("generated", pin=True))
+        self.tab_gen.pack(side="left", padx=(0, 2))
+        self.tab_prep = self._btn(bar, "Prepared", lambda: self._set_view("prepared", pin=True))
+        self.tab_prep.pack(side="left", padx=2)
+        self.save_btn = self._btn(bar, "＋ Save", self._save_generated)
+        self.save_btn.pack(side="right", padx=(2, 0))
+        self.regen_btn = self._btn(bar, "↻", self._regenerate)
+        self.regen_btn.pack(side="right", padx=2)
+        self.gen_status = tk.Label(bar, text="", fg=MUTED, bg=BG, font=self.small, anchor="w", justify="left")
+        self.gen_status.pack(side="left", fill="x", expand=True, padx=8)
+
+        body = tk.Frame(self.right, bg=PANEL)
+        body.pack(fill="both", expand=True)
         sb = tk.Scrollbar(body)
         sb.pack(side="right", fill="y")
         self.text = tk.Text(body, wrap="word", bg=PANEL, fg=FG, font=self.base, relief="flat", bd=0,
@@ -174,12 +224,12 @@ class Overlay:
             self.notes.configure(height=1)   # Tk keeps a frame's old size once its last child leaves
 
     def _rewrap(self, _e=None) -> None:
-        w = max(300, self.root.winfo_width() - 40)
+        w = max(160, self.left.winfo_width() - 18)
         self.heard.configure(wraplength=w)
         self.banner.configure(wraplength=w)
         self.hint.configure(wraplength=w)
         self.skeleton.configure(wraplength=w)
-        self.question.configure(wraplength=w - int(90 * self.scale))
+        self.question.configure(wraplength=max(120, w - int(70 * self.scale)))
 
     # ---------- events ----------
     def _pump(self) -> None:
@@ -202,6 +252,10 @@ class Overlay:
                     self._set_status(self.status.cget("text"))
                 elif kind == "forced_off":
                     self._forced_style(False)
+                elif kind == "gen_req":
+                    self._on_gen_req(*val)
+                elif kind == "gen":
+                    self._on_gen(*val)
         except queue.Empty:
             pass
         self._timers[0] = self.root.after(20, self._pump)
@@ -275,6 +329,36 @@ class Overlay:
         if not h.final and d.action == "show":
             self._early_shown.add(h.utt)
         self.events.put(("decision", (d, h)))
+        self._consider_generation(d, h)
+
+    def _consider_generation(self, d: Decision, h: Heard) -> None:
+        """Start drafting an answer for what was just asked, from the closest prepared answers."""
+        gen = self.gen
+        if gen is None or self.conv is None:
+            return
+        text = (d.heard or h.text).strip()
+        eligible = (h.final or d.action == "show") and len(text.split()) >= 4 and (
+            d.action in ("show", "followup", "unsure") or d.cue is not None or looks_like_question(text))
+        if not eligible:
+            if d.action == "show":
+                gen.cancel()            # a different answer is up now; stop drafting for the old question
+            return
+        ok, why = gen.status()
+        if not ok:
+            if self.cfg.get("generate", True) and why != self._gen_warned:
+                self._gen_warned = why
+                self.events.put(("gen", (0, "unavailable", why)))
+            return
+        thr = float(self.cfg["match_threshold"])
+        parent = d.parent if d.is_followup else None
+        req = build_request(text, d.matches, thr=thr, words=gen.words, max_matches=int(self.cfg.get("generate_matches", 3)),
+                            profile=gen.profile, parent=parent, cue=d.cue if parent else None,
+                            recent=self.conv.recent(2))
+        # a confident answer can't be a half-heard fragment; anything else waits a beat in case more is coming
+        delay = 0.5 if d.action in ("ignore", "unsure") and not text.endswith("?") else 0.0
+        job = gen.start(req, delay=delay)
+        # a follow-up with no scripted answer keeps the previous (parent) answer up, so it still counts as "prepared"
+        self.events.put(("gen_req", (job, req, d.action in ("show", "followup"))))
 
     def _set_heard(self, text: str, h: Heard | None = None) -> None:
         tail = ""
@@ -317,7 +401,11 @@ class Overlay:
             self.conf.configure(text=f"{m.score:.0%}", bg=color)
         self._set_notes(d.banner if d else "", d.hint if d else "")
         self.skeleton.configure(text=f"Skeleton: {e.skeleton}" if e.skeleton else "")
-        self._render(e.response)
+        self._prepared_md = e.response
+        self._clear_gen()
+        if d is None and self.gen:
+            self.gen.cancel()           # picked by hand: the user has decided, stop drafting
+        self._set_view("prepared")
         self._show_alts(matches[1:], label="Also:")
         self._show_likely(d.likely if d else (self.conv.followups_of(e) if self.conv else []))
 
@@ -386,6 +474,167 @@ class Overlay:
         btn.configure(text="Saved. It will match next time." if added else "Already known.", state="disabled")
         if added:
             self._reload_banks()
+
+    # ---------- drafted answers ----------
+    def _clear_gen(self) -> None:
+        """A different question's answer is up: forget the draft and ignore events from older jobs."""
+        self._gen_floor = self._gen_seen
+        self.gen_text, self.gen_state, self.gen_note, self.gen_summary = "", "idle", "", ""
+        self.gen_truncated = False
+        self._pinned_prepared = False
+        self._refresh_gen_ui()
+
+    def _begin_gen(self, job: int) -> None:
+        self._gen_job = self._gen_seen = max(self._gen_seen, job)
+        self.gen_text, self.gen_state, self.gen_note = "", "drafting", ""
+        self.gen_truncated = False
+        self._pinned_prepared = False
+
+    def _on_gen_req(self, job: int, req, has_prepared: bool) -> None:
+        if job <= self._gen_floor:
+            return
+        if job > self._gen_job:
+            self._begin_gen(job)
+        self._last_req = req
+        self.gen_summary = req.summary
+        if not has_prepared:      # nothing prepared fits: don't leave the last question's answer on screen
+            self.question.configure(text="No close prepared answer")
+            self.conf.configure(text="", bg=BG)
+            self.skeleton.configure(text="")
+            self._prepared_md = ""
+            self._set_view("generated")
+        self._refresh_gen_ui()
+        self._render_right()
+
+    def _on_gen(self, job: int, kind: str, data) -> None:
+        if kind == "unavailable":
+            self.gen_state, self.gen_note = "off", str(data)
+            self._set_view("prepared")
+            self._refresh_gen_ui()
+            return
+        if job <= self._gen_floor:
+            return
+        if job > self._gen_job:
+            self._begin_gen(job)
+        self._gen_seen = max(self._gen_seen, job)
+        if kind == "start":
+            self.gen_summary, self.gen_state = str(data), "drafting"
+        elif kind == "delta":
+            first = not self.gen_text
+            self.gen_text += str(data)
+            if first and not self._pinned_prepared:
+                self.view = "generated"
+            self._schedule_render()
+        elif kind == "done":
+            self.gen_text = (data.get("text") or self.gen_text).strip()
+            self.gen_state, self.gen_seconds = "done", float(data.get("seconds", 0.0))
+            self.gen_truncated = bool(data.get("truncated"))
+            self._render_right()
+        elif kind == "error":
+            self.gen_state, self.gen_note = "error", str(data)
+            if not self.gen_text:
+                self._set_view("prepared")
+        self._refresh_gen_ui()
+
+    def _schedule_render(self) -> None:
+        if not self._render_pending:
+            self._render_pending = True
+            self.root.after(70, self._flush_render)
+
+    def _flush_render(self) -> None:
+        self._render_pending = False
+        self._render_right()
+
+    def _set_view(self, view: str, pin: bool = False) -> None:
+        if view == "generated" and not (self.gen_text or self.gen_state == "drafting"):
+            view = "prepared"
+        self.view = view
+        if pin and view == "prepared" and self.gen_state == "drafting":
+            self._pinned_prepared = True
+        self._refresh_gen_ui()
+        self._render_right()
+
+    def _render_right(self) -> None:
+        if self.view == "generated":
+            if self.gen_text:
+                self._render(self._stream_safe(self.gen_text) if self.gen_state == "drafting" else self.gen_text)
+            else:
+                self._render("Drafting an answer from your prepared answers…")
+        else:
+            self._render(self._prepared_md)
+
+    @staticmethod
+    def _stream_safe(md: str) -> str:
+        """Half-streamed text may end inside **bold** or {{a placeholder}}; hide the unfinished marker."""
+        if md.count("**") % 2:
+            md = md[: md.rfind("**")] + md[md.rfind("**") + 2:]
+        if md.rfind("{{") > md.rfind("}}"):
+            md = md[: md.rfind("{{")]
+        return md
+
+    def _refresh_gen_ui(self) -> None:
+        """Tabs, status line and the Regenerate / Save buttons for the current draft state."""
+        wanted = bool(self.cfg.get("generate", True))
+        usable = wanted and self.gen_state != "off" and (self.gen is None or self.gen.status()[0])
+        have = bool(self.gen_text) or self.gen_state == "drafting"
+        self.gen_btn.configure(text="✨ Draft: on" if wanted else "✨ Draft: off")
+        for btn, on in ((self.tab_gen, self.view == "generated"), (self.tab_prep, self.view == "prepared")):
+            btn.configure(bg=ACCENT if on else PANEL, fg=BG if on else FG)
+        self.tab_gen.configure(state="normal" if (usable and have) else "disabled")
+        self.regen_btn.configure(state="normal" if (usable and self._last_req is not None
+                                                    and self.gen_state in ("done", "error")) else "disabled")
+        self.save_btn.configure(state="normal" if (self.gen_state == "done" and self.gen_text) else "disabled")
+        color, text = MUTED, ""
+        if self.gen_state == "drafting":
+            text = "✨ drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else "")
+        elif self.gen_state == "done":
+            text = f"✨ {self.gen_summary}  ·  {self.gen_seconds:.1f}s" + ("  ·  cut short" if self.gen_truncated else "")
+        elif self.gen_state in ("error", "off") and self.gen_note:
+            color, text = WARN, self.gen_note
+        elif self.view == "prepared" and self._prepared_md:
+            text = "Prepared answer"
+        self.gen_status.configure(text=text, fg=color)
+
+    def _toggle_gen(self) -> None:
+        self.cfg["generate"] = not self.cfg.get("generate", True)
+        self._gen_warned = ""
+        if not self.cfg["generate"]:
+            if self.gen:
+                self.gen.cancel()
+            self._clear_gen()
+            self._set_view("prepared")
+        self._save_cfg()
+        self._refresh_gen_ui()
+
+    def _regenerate(self) -> None:
+        if self.gen and self._last_req is not None:
+            job = self.gen.start(self._last_req)
+            self._on_gen_req(job, self._last_req, True)
+
+    def _save_generated(self) -> None:
+        """Keep a good draft: it becomes a normal prepared answer, matched by voice from now on."""
+        if not (self.gen_text and self._last_req):
+            return
+        req = self._last_req
+        name = req.sources[0].bank if req.sources else (self.cfg.get("active_banks") or [""])[0]
+        try:
+            bk = bankmod.load_bank(name)
+        except KeyError:
+            self.gen_status.configure(text="No active bank to save into.", fg=WARN)
+            return
+        q = req.question.strip()
+        if any(e.question.strip().lower() == q.lower() for e in bk.entries):
+            self.gen_status.configure(text="That question is already in the bank.", fg=WARN)
+            return
+        bk.entries.append(bankmod.Entry(question=q, response=self.gen_text, tags=["generated"], bank=bk.name))
+        try:
+            bk.save()
+        except OSError as e:
+            self.gen_status.configure(text=f"Couldn't save: {e}", fg=WARN)
+            return
+        self.save_btn.configure(state="disabled")
+        self.gen_status.configure(text=f"Saved to “{bk.title or bk.name}”. Edit it in Manage banks.", fg=GOOD)
+        self._reload_banks()
 
     def _render(self, md: str) -> None:
         t = self.text
@@ -497,6 +746,7 @@ class Overlay:
     def _save_cfg(self) -> None:
         disk = bankmod.load_config()
         disk["font_size"] = self.cfg["font_size"]
+        disk["generate"] = self.cfg.get("generate", True)
         bankmod.save_config(disk)
 
     def _quit(self) -> None:
@@ -504,6 +754,8 @@ class Overlay:
         # reference, or the garbage collector ran there, Tcl would be called from the wrong thread and hang
         # or abort. So: stop the workers, wait for the one that holds the window, and keep the collector off.
         self.listener.stop()
+        if self.gen:
+            self.gen.cancel()
         self.heard_q.put(None)
         self._match_thread.join(timeout=2)
         gc.disable()

@@ -48,6 +48,12 @@ DEFAULT_CONFIG = {
     "followup_window_seconds": 120,  # how long an answer stays "the topic" for follow-ups
     "early_silence_seconds": 0.35,   # start transcribing after this much quiet (0 = wait the full silence_seconds)
     "reconnect_idle_seconds": 45,    # re-open the audio device after this long with no sound (0 = off)
+    "generate": True,                # draft a spoken answer for each question (needs the anthropic package + a key)
+    "generate_model": "claude-opus-5-5",
+    "generate_effort": "low",        # low = fastest; medium/high think longer
+    "generate_words": 130,           # about how long a drafted answer should be
+    "generate_matches": 3,           # how many of your prepared answers are sent as the source material
+    "generate_max_tokens": 4000,
 }
 
 META_KEYS = ("also", "follows", "tags", "skeleton")

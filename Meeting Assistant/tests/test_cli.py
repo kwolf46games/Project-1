@@ -1,3 +1,4 @@
+import sys
 import wave
 from types import SimpleNamespace
 
@@ -153,3 +154,76 @@ def test_audiotest_diagnoses_each_stage(cli, capsys, monkeypatch, script, expect
     monkeypatch.setattr(audio, "Listener", FakeListener)
     app.main(["audiotest", "--seconds", "1"])
     assert expect.lower() in capsys.readouterr().out.lower()
+
+
+# ---------- generate ----------
+
+import generate as gen  # noqa: E402
+
+RealGenerator = gen.Generator
+
+
+def _fake_generator(monkeypatch, pieces=("**Own it.** ", "I {{verb}} well."), fail=None):
+    from test_generate import FakeClient
+    client = FakeClient(pieces=list(pieces), fail=fail)
+    monkeypatch.setattr(gen, "Generator", lambda cfg, on_event: RealGenerator(cfg, on_event, client_factory=lambda: client))
+    return client
+
+
+@pytest.fixture
+def gen_cli(cli, monkeypatch):
+    monkeypatch.setattr(gen, "KEY_FILE", cli / "no_key.txt")
+    monkeypatch.setattr(gen, "PROFILE_FILE", cli / "no_profile.md")
+    return cli
+
+
+def test_generate_prints_the_streamed_draft_and_timing(gen_cli, capsys, monkeypatch):
+    client = _fake_generator(monkeypatch)
+    app.main(["generate", "Tell me about a time you led a team?"])
+    out = capsys.readouterr().out
+    assert "(adapted from your prepared answer)" in out and "**Own it.** I {{verb}} well." in out
+    assert "tokens in" in out and "first words after" in out
+    sent = client.calls[0]["messages"][0]["content"]
+    assert "led a team" in sent and "LEAD" in sent
+
+
+def test_generate_show_prompt_discloses_what_is_sent(gen_cli, capsys, monkeypatch):
+    _fake_generator(monkeypatch)
+    app.main(["generate", "What is your biggest weakness?", "--show-prompt"])
+    out = capsys.readouterr().out
+    assert "=== SYSTEM ===" in out and "Never invent personal facts" in out
+    assert "=== MESSAGE ===" in out and "<question>\nWhat is your biggest weakness?\n</question>" in out and "WEAK" in out
+
+
+def test_generate_as_a_followup(gen_cli, capsys, monkeypatch):
+    client = _fake_generator(monkeypatch)
+    app.main(["generate", "Can you elaborate on that?", "--after", "led a team"])
+    p = client.calls[0]["messages"][0]["content"]
+    assert "follow-up (asking for more detail) to an earlier question: Tell me about a time you led a team" in p
+
+
+def test_generate_needs_a_question(gen_cli, monkeypatch):
+    _fake_generator(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        app.main(["generate"])
+    assert "Give the question" in str(e.value)
+
+
+def test_generate_explains_a_missing_package(gen_cli, monkeypatch):
+    monkeypatch.setattr(gen, "Generator", RealGenerator)               # the real one, with no client injected
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    with pytest.raises(SystemExit) as e:
+        app.main(["generate", "Tell me about yourself?"])
+    assert "pip install anthropic" in str(e.value)
+
+
+def test_generate_check_reports_success_and_failure(gen_cli, capsys, monkeypatch):
+    _fake_generator(monkeypatch, pieces=["OK"])
+    app.main(["generate", "--check"])
+    out = capsys.readouterr().out
+    assert "model: claude-opus-5-5" in out and "OK: the API key and connection work." in out
+    from test_generate import _api_error
+    _fake_generator(monkeypatch, fail=_api_error("AuthenticationError", 401))
+    app.main(["generate", "--check"])
+    out = capsys.readouterr().out
+    assert "key was rejected" in out and "OK: the API key" not in out

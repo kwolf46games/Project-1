@@ -14,6 +14,8 @@
   it test "what was the outcome?" --after "Tell me about yourself"
                                           ...as a follow-up to an answer that was just shown
   it suggest BANK [N|TEXT] [--apply]      suggest extra phrasings for each question (--apply adds the safe ones)
+  it generate "a question"                draft an answer from your banks (needs the anthropic package + an API key)
+  it generate --check                     live check of your API key and connection
   it devices                              list audio outputs that can be captured
   it audiotest [--seconds 10]             check live that audio arrives and is turned into text
   it transcribe FILE.wav [--match]        run a recording through the same audio -> text -> answer chain
@@ -21,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -185,6 +188,80 @@ def cmd_suggest(a) -> None:
               "'Manage banks'.")
 
 
+def cmd_generate(a) -> None:
+    import threading
+
+    import generate as gen
+    cfg = b.load_config()
+    done = threading.Event()
+    started = time.monotonic()
+    state = {"first": None, "error": ""}
+
+    def on_event(job, kind, data) -> None:
+        if kind == "start":
+            print(f"({data})\n")
+        elif kind == "delta":
+            if state["first"] is None:
+                state["first"] = time.monotonic() - started
+            print(data, end="", flush=True)
+        elif kind == "done":
+            print(f"\n\n[{data['seconds']:.1f}s total, first words after {data['first']:.1f}s; "
+                  f"{data['input_tokens']} tokens in, {data['output_tokens']} out"
+                  + (f", {data['cached_tokens']} from cache" if data["cached_tokens"] else "")
+                  + (", cut short" if data["truncated"] else "") + "]")
+            done.set()
+        elif kind == "error":
+            state["error"] = data
+            print(f"\n{data}")
+            done.set()
+    g = gen.Generator(cfg, on_event)
+    if a.check:
+        ok, why = g.status()
+        key = ("ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY")
+               else f"{gen.KEY_FILE.name}" if gen.KEY_FILE.exists() else "none found (the SDK will try its own sources)")
+        print(f"package: {'ok' if ok or 'package' not in why else 'MISSING - ' + why}\nkey: {key}\nmodel: {g.model}")
+        if not ok:
+            print(f"PROBLEM: {why}")
+            return
+        req = gen.Request([{"type": "text", "text": "Reply with the single word OK."}],
+                          [{"role": "user", "content": "ping"}], "connection check", "ping")
+        g.cfg = {**cfg, "generate_max_tokens": 200}
+        g.start(req)
+        done.wait(40)
+        print("OK: the API key and connection work." if done.is_set() and not state["error"] else "")
+        return
+    if not a.text:
+        raise ValueError("Give the question to answer, e.g.  it generate \"Tell me about a time you led a team\"")
+    ok, why = g.status()
+    if not ok:
+        raise ValueError(why)
+    from followup import Conversation
+    from matcher import Matcher
+    m = Matcher()
+    entries = b.active_entries()
+    m.load(entries)
+    conv = Conversation(m, cfg)
+    if a.after:
+        hits = [e for e in entries if a.after.lower() in e.question.lower()]
+        if len(hits) != 1:
+            raise KeyError(f"--after '{a.after}' matches {len(hits)} active questions; be more specific.")
+        conv.note(hits[0])
+    d = conv.resolve(a.text)
+    matches = d.matches or m.match(a.text, k=3)
+    req = gen.build_request(a.text, matches, thr=float(cfg["match_threshold"]), words=g.words,
+                            max_matches=int(cfg.get("generate_matches", 3)), profile=g.profile,
+                            parent=d.parent if d.is_followup else None, cue=d.cue if d.is_followup else None,
+                            recent=conv.recent(2))
+    if a.show_prompt:
+        print("=== SYSTEM ===")
+        for blk in req.system:
+            print(blk["text"], "\n")
+        print("=== MESSAGE ===")
+        print(req.messages[0]["content"], "\n=== END ===\n")
+    g.start(req)
+    done.wait(90)
+
+
 def cmd_devices(_a) -> None:
     from audio import list_loopback_devices
     for d in list_loopback_devices():
@@ -294,6 +371,11 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--apply", action="store_true", help="add the safe suggestions to the bank")
     x.add_argument("--max", type=int, default=5, help="suggestions per question (default 5)")
     x.add_argument("--no-check", action="store_true", help="skip checking against your other questions (faster)")
+    x = sub.add_parser("generate")
+    x.add_argument("text", nargs="?", help="the question to answer")
+    x.add_argument("--after", help="part of the question whose answer is on screen (to draft a follow-up)")
+    x.add_argument("--show-prompt", action="store_true", help="print exactly what is sent to the API")
+    x.add_argument("--check", action="store_true", help="test the API key and connection with a tiny request")
     x = sub.add_parser("audiotest")
     x.add_argument("--seconds", type=int, default=10)
     x = sub.add_parser("transcribe")
@@ -329,7 +411,7 @@ def main(argv: list[str] | None = None) -> None:
             Overlay().run()
         else:
             {"banks": cmd_banks, "q": cmd_q, "test": cmd_test, "devices": cmd_devices, "suggest": cmd_suggest,
-             "audiotest": cmd_audiotest, "transcribe": cmd_transcribe}[a.cmd](a)
+             "generate": cmd_generate, "audiotest": cmd_audiotest, "transcribe": cmd_transcribe}[a.cmd](a)
     except (KeyError, ValueError) as e:
         sys.exit(f"Error: {e.args[0] if e.args else e}")
 

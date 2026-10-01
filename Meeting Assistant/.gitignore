@@ -1,0 +1,7 @@
+# secrets and personal details: never commit these
+anthropic_key.txt
+profile.md
+
+# generated
+__pycache__/
+.pytest_cache/
