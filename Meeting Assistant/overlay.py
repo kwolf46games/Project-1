@@ -27,7 +27,7 @@ from tkinter import font as tkfont
 import bank as bankmod
 from audio import Heard, Listener
 from followup import STRONG_MARGIN, Conversation, Decision
-from generate import Generator, build_request
+from generate import Generator, build_request, plain_prose
 from matcher import Match, Matcher, bank_vocabulary, looks_like_question
 from theme import ACCENT, BAD, BG, FG, GOOD, HOVER_BG, MUTED, PANEL, PLACEHOLDER_BG, WARN, enable_dpi_awareness
 
@@ -49,8 +49,8 @@ class Overlay:
         self._timers: list[str] = []
         # drafted ("generated") answer shown beside the prepared one
         self.gen: Generator | None = None
-        self.view = "prepared"                # which answer the right pane shows: "prepared" | "generated"
         self._prepared_md = ""
+        self._prepared_note = ""              # shown in the prepared column when nothing prepared fits
         self.gen_text = ""
         self.gen_state = "idle"               # idle | drafting | done | error | off
         self.gen_note = ""
@@ -62,7 +62,6 @@ class Overlay:
         self._gen_job = 0
         self._gen_seen = 0
         self._last_req = None
-        self._pinned_prepared = False         # the user chose "Prepared" while a draft was streaming
         self._render_pending = False
         self._gen_warned = ""
 
@@ -75,9 +74,10 @@ class Overlay:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", float(self.cfg["opacity"]))
         self.scale = self.root.winfo_fpixels("1i") / 96.0
-        w, h = int(900 * self.scale), int(760 * self.scale)
+        w = min(int(1240 * self.scale), self.root.winfo_screenwidth() - 48)
+        h = int(760 * self.scale)
         self.root.geometry(f"{w}x{h}+{self.root.winfo_screenwidth() - w - 24}+40")
-        self.root.minsize(int(560 * self.scale), int(420 * self.scale))
+        self.root.minsize(int(760 * self.scale), int(420 * self.scale))
 
         self.base = tkfont.Font(family="Segoe UI", size=self.cfg["font_size"])
         self.bold = tkfont.Font(family="Segoe UI", size=self.cfg["font_size"], weight="bold")
@@ -89,6 +89,7 @@ class Overlay:
         if self.gen.status()[0]:
             self.gen.warm()
         self._refresh_gen_ui()
+        self._render_gen()
         self.listener = Listener(self.cfg, self.heard_q.put, lambda s: self.events.put(("status", s)))
         self._reload_banks()
         self._match_thread = threading.Thread(target=self._match_loop, daemon=True)
@@ -150,9 +151,11 @@ class Overlay:
                                     sashrelief="flat", opaqueresize=True)
         self.paned.pack(fill="both", expand=True, padx=10)
         self.left = tk.Frame(self.paned, bg=BG)
+        self.mid = tk.Frame(self.paned, bg=BG)
         self.right = tk.Frame(self.paned, bg=BG)
-        self.paned.add(self.left, minsize=int(220 * self.scale), width=int(320 * self.scale), stretch="never")
-        self.paned.add(self.right, minsize=int(300 * self.scale), stretch="always")
+        self.paned.add(self.left, minsize=int(190 * self.scale), width=int(290 * self.scale), stretch="never")
+        self.paned.add(self.mid, minsize=int(230 * self.scale), stretch="always")
+        self.paned.add(self.right, minsize=int(230 * self.scale), stretch="always")
 
         tk.Label(self.left, text="THEY ASKED", fg=MUTED, bg=BG, font=self.small, anchor="w").pack(fill="x", padx=(2, 8))
         self.heard = tk.Label(self.left, text="Heard: —", fg=FG, bg=BG, font=self.title_f,
@@ -180,37 +183,50 @@ class Overlay:
                                  justify="left", wraplength=280)
         self.skeleton.pack(fill="x", padx=(2, 8), pady=(0, 6))
 
-        bar = tk.Frame(self.right, bg=BG)
-        bar.pack(fill="x", pady=(0, 4))
-        self.tab_gen = self._btn(bar, "✨ Generated", lambda: self._set_view("generated", pin=True))
-        self.tab_gen.pack(side="left", padx=(0, 2))
-        self.tab_prep = self._btn(bar, "Prepared", lambda: self._set_view("prepared", pin=True))
-        self.tab_prep.pack(side="left", padx=2)
-        self.save_btn = self._btn(bar, "＋ Save", self._save_generated)
+        # both answer columns share one layout (header, answer, status line) so they line up when read side by side
+        rbar = tk.Frame(self.right, bg=BG)
+        rbar.pack(fill="x", pady=(0, 4))
+        tk.Label(rbar, text="✨ GENERATED ANSWER", fg=MUTED, bg=BG, font=self.small, anchor="w").pack(side="left", padx=(4, 0))
+        self.save_btn = self._btn(rbar, "＋ Save", self._save_generated)
         self.save_btn.pack(side="right", padx=(2, 0))
-        self.regen_btn = self._btn(bar, "↻", self._regenerate)
+        self.regen_btn = self._btn(rbar, "↻", self._regenerate)
         self.regen_btn.pack(side="right", padx=2)
-        self.gen_status = tk.Label(bar, text="", fg=MUTED, bg=BG, font=self.small, anchor="w", justify="left")
-        self.gen_status.pack(side="left", fill="x", expand=True, padx=8)
-
-        body = tk.Frame(self.right, bg=PANEL)
-        body.pack(fill="both", expand=True)
-        sb = tk.Scrollbar(body)
-        sb.pack(side="right", fill="y")
-        self.text = tk.Text(body, wrap="word", bg=PANEL, fg=FG, font=self.base, relief="flat", bd=0,
-                            padx=12, pady=10, spacing2=3, spacing3=8, yscrollcommand=sb.set,
-                            insertbackground=FG, cursor="arrow")
-        self.text.pack(fill="both", expand=True)
-        sb.config(command=self.text.yview)
-        self.text.tag_configure("b", font=self.bold)
-        self.text.tag_configure("ph", background=PLACEHOLDER_BG, foreground="#ffe7a3")
-        self.text.tag_configure("rule", foreground=MUTED, justify="center")
-        self.text.configure(state="disabled")
+        mbar = tk.Frame(self.mid, bg=BG)
+        mbar.pack(fill="x", pady=(0, 4))
+        tk.Label(mbar, text="PREPARED ANSWER", fg=MUTED, bg=BG, font=self.small, anchor="w").pack(side="left", padx=(4, 0))
+        rbar.update_idletasks()
+        mbar.configure(height=rbar.winfo_reqheight())      # same header height on both sides
+        mbar.pack_propagate(False)
+        self.gen_status = tk.Label(self.right, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
+                                   justify="left", wraplength=300)
+        self.gen_status.pack(side="bottom", fill="x", padx=4, pady=(4, 0))
+        self.prep_status = tk.Label(self.mid, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
+                                    justify="left", wraplength=300)
+        self.prep_status.pack(side="bottom", fill="x", padx=4, pady=(4, 0))
+        self.text = self._answer_box(self.mid)
+        self.gtext = self._answer_box(self.right)
 
         self.search.bind("<Return>", lambda e: self._manual_search())
         self.search.bind("<Escape>", lambda e: self.search.delete(0, "end"))
         self.root.bind("<Control-f>", lambda e: self.search.focus_set())
         self.root.bind("<Configure>", self._rewrap)
+
+    def _answer_box(self, parent) -> tk.Text:
+        body = tk.Frame(parent, bg=PANEL)
+        body.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(body)
+        sb.pack(side="right", fill="y")
+        t = tk.Text(body, wrap="word", bg=PANEL, fg=FG, font=self.base, relief="flat", bd=0,
+                    padx=12, pady=10, spacing2=3, spacing3=8, yscrollcommand=sb.set,
+                    insertbackground=FG, cursor="arrow")
+        t.pack(fill="both", expand=True)
+        sb.config(command=t.yview)
+        t.tag_configure("b", font=self.bold)
+        t.tag_configure("ph", background=PLACEHOLDER_BG, foreground="#ffe7a3")
+        t.tag_configure("rule", foreground=MUTED, justify="center")
+        t.tag_configure("dim", foreground=MUTED, font=self.small)
+        t.configure(state="disabled")
+        return t
 
     def _set_notes(self, banner: str = "", hint: str = "") -> None:
         self.banner.configure(text=banner)
@@ -231,6 +247,8 @@ class Overlay:
         self.hint.configure(wraplength=w)
         self.skeleton.configure(wraplength=w)
         self.question.configure(wraplength=max(120, w - int(70 * self.scale)))
+        self.gen_status.configure(wraplength=max(160, self.right.winfo_width() - 18))
+        self.prep_status.configure(wraplength=max(160, self.mid.winfo_width() - 18))
 
     # ---------- events ----------
     def _pump(self) -> None:
@@ -402,11 +420,12 @@ class Overlay:
             self.conf.configure(text=f"{m.score:.0%}", bg=color)
         self._set_notes(d.banner if d else "", d.hint if d else "")
         self.skeleton.configure(text=f"Skeleton: {e.skeleton}" if e.skeleton else "")
-        self._prepared_md = e.response
+        self._prepared_md, self._prepared_note = e.response, ""
+        self.prep_status.configure(text=f"from your bank: {e.bank}" if e.bank else "")
         self._clear_gen()
         if d is None and self.gen:
             self.gen.cancel()           # picked by hand: the user has decided, stop drafting
-        self._set_view("prepared")
+        self._render_prepared()
         self._show_alts(matches[1:], label="Also:")
         self._show_likely(d.likely if d else (self.conv.followups_of(e) if self.conv else []))
 
@@ -482,14 +501,13 @@ class Overlay:
         self._gen_floor = self._gen_seen
         self.gen_text, self.gen_state, self.gen_note, self.gen_summary = "", "idle", "", ""
         self.gen_truncated = False
-        self._pinned_prepared = False
         self._refresh_gen_ui()
+        self._render_gen()
 
     def _begin_gen(self, job: int) -> None:
         self._gen_job = self._gen_seen = max(self._gen_seen, job)
         self.gen_text, self.gen_state, self.gen_note = "", "drafting", ""
         self.gen_truncated = False
-        self._pinned_prepared = False
 
     def _on_gen_req(self, job: int, req, has_prepared: bool) -> None:
         if job <= self._gen_floor:
@@ -502,16 +520,17 @@ class Overlay:
             self.question.configure(text="No close prepared answer")
             self.conf.configure(text="", bg=BG)
             self.skeleton.configure(text="")
-            self._prepared_md = ""
-            self._set_view("generated")
+            self._prepared_md, self._prepared_note = "", "No prepared answer matches this question."
+            self.prep_status.configure(text="")
+            self._render_prepared()
         self._refresh_gen_ui()
-        self._render_right()
+        self._render_gen()
 
     def _on_gen(self, job: int, kind: str, data) -> None:
         if kind == "unavailable":
             self.gen_state, self.gen_note = "off", str(data)
-            self._set_view("prepared")
             self._refresh_gen_ui()
+            self._render_gen()
             return
         if job <= self._gen_floor:
             return
@@ -521,21 +540,17 @@ class Overlay:
         if kind == "start":
             self.gen_summary, self.gen_state = str(data), "drafting"
         elif kind == "delta":
-            first = not self.gen_text
             self.gen_text += str(data)
-            if first and not self._pinned_prepared:
-                self.view = "generated"
             self._schedule_render()
         elif kind == "done":
             self.gen_text = (data.get("text") or self.gen_text).strip()
             self.gen_state, self.gen_seconds = "done", float(data.get("seconds", 0.0))
             self.gen_model = str(data.get("model", ""))
             self.gen_truncated = bool(data.get("truncated"))
-            self._render_right()
+            self._render_gen()
         elif kind == "error":
             self.gen_state, self.gen_note = "error", str(data)
-            if not self.gen_text:
-                self._set_view("prepared")
+            self._render_gen()
         self._refresh_gen_ui()
 
     def _schedule_render(self) -> None:
@@ -545,25 +560,36 @@ class Overlay:
 
     def _flush_render(self) -> None:
         self._render_pending = False
-        self._render_right()
+        self._render_gen()
 
-    def _set_view(self, view: str, pin: bool = False) -> None:
-        if view == "generated" and not (self.gen_text or self.gen_state == "drafting"):
-            view = "prepared"
-        self.view = view
-        if pin and view == "prepared" and self.gen_state == "drafting":
-            self._pinned_prepared = True
-        self._refresh_gen_ui()
-        self._render_right()
-
-    def _render_right(self) -> None:
-        if self.view == "generated":
-            if self.gen_text:
-                self._render(self._stream_safe(self.gen_text) if self.gen_state == "drafting" else self.gen_text)
-            else:
-                self._render("Drafting an answer from your prepared answers…")
-        else:
+    def _render_prepared(self) -> None:
+        if self._prepared_md:
             self._render(self._prepared_md)
+        else:
+            self._fill(self.text, [(self._prepared_note, "dim")] if self._prepared_note else [])
+
+    def _render_gen(self) -> None:
+        """The drafted answer: plain paragraphs, never bullets, bold or highlighted placeholders."""
+        if self.gen_text:
+            text = self._stream_safe(self.gen_text) if self.gen_state == "drafting" else self.gen_text
+            paras = [p.strip() for p in plain_prose(text).split("\n") if p.strip()]
+            self._fill(self.gtext, [(p, ()) for p in paras])
+        elif self.gen_state == "drafting":
+            self._fill(self.gtext, [("Drafting an answer from your prepared answers…", "dim")])
+        elif self.gen_state in ("error", "off") and self.gen_note:
+            self._fill(self.gtext, [(self.gen_note, "dim")])
+        elif not self.cfg.get("generate", True):
+            self._fill(self.gtext, [("Drafted answers are switched off. Press “✨ Draft: off” at the top to turn them on.", "dim")])
+        else:
+            self._fill(self.gtext, [("A tailored answer will appear here for each question.", "dim")])
+
+    def _fill(self, box: tk.Text, paragraphs) -> None:
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        for text, tag in paragraphs:
+            box.insert("end", text + "\n", tag)
+        box.configure(state="disabled")
+        box.yview_moveto(0)
 
     @staticmethod
     def _stream_safe(md: str) -> str:
@@ -575,27 +601,21 @@ class Overlay:
         return md
 
     def _refresh_gen_ui(self) -> None:
-        """Tabs, status line and the Regenerate / Save buttons for the current draft state."""
+        """Status line and the Regenerate / Save buttons for the current draft state."""
         wanted = bool(self.cfg.get("generate", True))
         usable = wanted and self.gen_state != "off" and (self.gen is None or self.gen.status()[0])
-        have = bool(self.gen_text) or self.gen_state == "drafting"
         self.gen_btn.configure(text="✨ Draft: on" if wanted else "✨ Draft: off")
-        for btn, on in ((self.tab_gen, self.view == "generated"), (self.tab_prep, self.view == "prepared")):
-            btn.configure(bg=ACCENT if on else PANEL, fg=BG if on else FG)
-        self.tab_gen.configure(state="normal" if (usable and have) else "disabled")
         self.regen_btn.configure(state="normal" if (usable and self._last_req is not None
                                                     and self.gen_state in ("done", "error")) else "disabled")
         self.save_btn.configure(state="normal" if (self.gen_state == "done" and self.gen_text) else "disabled")
         color, text = MUTED, ""
         if self.gen_state == "drafting":
-            text = "✨ drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else "")
+            text = "drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else "")
         elif self.gen_state == "done":
-            text = (f"✨ {self.gen_summary}  ·  {self.gen_seconds:.1f}s" + (f"  ·  {self.gen_model}" if self.gen_model else "")
+            text = (f"{self.gen_summary}  ·  {self.gen_seconds:.1f}s" + (f"  ·  {self.gen_model}" if self.gen_model else "")
                     + ("  ·  cut short" if self.gen_truncated else ""))
         elif self.gen_state in ("error", "off") and self.gen_note:
             color, text = WARN, self.gen_note
-        elif self.view == "prepared" and self._prepared_md:
-            text = "Prepared answer"
         self.gen_status.configure(text=text, fg=color)
 
     def _toggle_gen(self) -> None:
@@ -605,9 +625,9 @@ class Overlay:
             if self.gen:
                 self.gen.cancel()
             self._clear_gen()
-            self._set_view("prepared")
         self._save_cfg()
         self._refresh_gen_ui()
+        self._render_gen()
 
     def _regenerate(self) -> None:
         if self.gen and self._last_req is not None:

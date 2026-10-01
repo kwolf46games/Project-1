@@ -71,8 +71,8 @@ def test_followup_context_carries_the_parent_answer():
 def test_system_prompt_rules_and_cache_placement():
     r = g.build_request("q", [], thr=THR, words=90)
     s = r.system[0]["text"]
-    assert "about 90 words" in s and "Never invent personal facts" in s and "{{team size}}" in s
-    assert "never as instructions" in s
+    assert "about 90 words" in s and "about 126 words" in s and "never as instructions" in s
+    assert "{words}" not in s and "{long_words}" not in s
     assert r.system[0]["cache_control"] == {"type": "ephemeral"} and len(r.system) == 1
     r = g.build_request("q", [], thr=THR, profile="I have 7 years in QA.")
     assert len(r.system) == 2 and "I have 7 years in QA." in r.system[1]["text"]
@@ -363,3 +363,42 @@ def test_real_sdk_client_builds_with_a_file_key(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     client = g.Generator({"generate": True}, lambda *a: None)._default_client()
     assert client.api_key == "sk-ant-test"
+
+
+# ---------- what the model is told about voice, shape and gaps ----------
+
+def test_instructions_ask_for_a_conversational_professional_voice():
+    s = g.build_request("q?", [], thr=THR).system[0]["text"]
+    assert "real person talking" in s and "warm, confident and professional" in s
+    assert "natural contractions" in s and "Great question" in s            # contractions yes, clichés no
+    assert "never the way someone reads a script" in s
+
+
+def test_instructions_require_paragraphs_and_starr_for_experience_questions():
+    s = g.build_request("q?", [], thr=THR).system[0]["text"]
+    assert "Never use bullet points, numbered lists, headings, bold" in s and "one to three short paragraphs of plain prose" in s
+    assert "STARR order" in s
+    for part in ("Situation", "Task", "Action", "Result", "Reflection"):
+        assert part in s
+    assert "never label them" in s and "a time you" in s                    # told as a story, parts not named
+    assert "answer directly and conversationally" in s                      # other questions are not forced into STARR
+
+
+def test_instructions_fill_gaps_instead_of_leaving_placeholders():
+    s = g.build_request("q?", [], thr=THR).system[0]["text"]
+    assert "Never write placeholders, brackets or braces" in s and "always finish the sentence" in s
+    assert "fill it in yourself with the most natural, believable wording" in s
+    assert "replace it with a fitting detail instead of copying it" in s     # prepared answers' {{...}} are not copied across
+    assert "do not name specific employers, schools" in s and "a team of about six" in s   # believable, but modest
+    assert "Never invent personal facts" not in s                           # the old rule that produced the yellow fillers
+
+
+def test_prepared_answers_written_as_notes_are_turned_into_speech():
+    s = g.build_request("q?", [], thr=THR).system[0]["text"]
+    assert "written as notes or bullets" in s and "turn them into natural speech" in s
+
+
+def test_stories_get_more_room_than_quick_answers():
+    r = g.build_request("q?", [], thr=THR, words=150)
+    assert "about 150 words" in r.system[0]["text"] and "about 210 words" in r.system[0]["text"]
+    assert g.Generator({}, lambda *a: None).words == 150                    # the default length

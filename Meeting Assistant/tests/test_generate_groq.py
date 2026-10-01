@@ -110,9 +110,9 @@ def test_payload_is_what_groq_expects():
     run(gen)
     p = h.seen[0]
     assert p["model"] == g.GROQ_DEFAULT_MODEL and p["stream"] is True and p["max_tokens"] == 900
-    assert p["stream_options"] == {"include_usage": True} and p["temperature"] == 0.4
+    assert p["stream_options"] == {"include_usage": True} and p["temperature"] == 0.6
     assert [m["role"] for m in p["messages"]] == ["system", "user"]
-    assert "Never invent personal facts" in p["messages"][0]["content"]
+    assert "Never use bullet points" in p["messages"][0]["content"]
     assert "<question>\nwhat is your biggest weakness?\n</question>" in p["messages"][1]["content"]
     assert "cache_control" not in json.dumps(p) and "output_config" not in p      # Anthropic-only fields stay out
 
@@ -123,17 +123,17 @@ def test_profile_is_part_of_the_system_message():
     run(gen, g.build_request("q?", [], thr=THR, profile="I have 7 years in QA."))
     sysmsg = h.seen[0]["messages"][0]["content"]
     assert "PROFILE (facts about the user):\nI have 7 years in QA." in sysmsg
-    assert sysmsg.index("Never invent") < sysmsg.index("PROFILE (facts about the user)")      # the facts follow the rules
+    assert sysmsg.index("Never write placeholders") < sysmsg.index("PROFILE (facts about the user)")      # the facts follow the rules
 
 
 def test_streams_deltas_usage_and_model():
-    h = hook(chunk("**Own it.** "), chunk("I work "), chunk("hard."), chunk(finish="stop"),
+    h = hook(chunk("Own it. "), chunk("I work "), chunk("hard."), chunk(finish="stop"),
              chunk(empty=True, usage={"prompt_tokens": 812, "completion_tokens": 44,
                                       "prompt_tokens_details": {"cached_tokens": 700}}))
     ev = run(g.Generator({"generate": True}, lambda *a: None, http=h))
     assert [k for k, _ in ev] == ["start", "delta", "delta", "delta", "done"]
     done = ev[-1][1]
-    assert done["text"] == "**Own it.** I work hard." and done["provider"] == "groq" and done["model"] == g.GROQ_DEFAULT_MODEL
+    assert done["text"] == "Own it. I work hard." and done["provider"] == "groq" and done["model"] == g.GROQ_DEFAULT_MODEL
     assert (done["input_tokens"], done["output_tokens"], done["cached_tokens"]) == (812, 44, 700) and not done["truncated"]
 
 
@@ -150,9 +150,9 @@ def test_leading_blank_output_and_garbage_lines_are_ignored():
 
 
 def test_thinking_tags_never_reach_the_screen():
-    h = hook(chunk("<thi"), chunk("nk>weighing it up</th"), chunk("ink>**Plan.** "), chunk("Do it."))
+    h = hook(chunk("<thi"), chunk("nk>weighing it up</th"), chunk("ink>Plan. "), chunk("Do it."))
     ev = run(g.Generator({"generate": True}, lambda *a: None, http=h))
-    assert ev[-1][1]["text"] == "**Plan.** Do it." and not any("think" in str(d) for k, d in ev if k == "delta")
+    assert ev[-1][1]["text"] == "Plan. Do it." and not any("think" in str(d) for k, d in ev if k == "delta")
 
 
 @pytest.mark.parametrize("pieces,expect", [
@@ -378,7 +378,11 @@ def test_end_to_end_request_survives_the_overlay_prompt():
 
 
 @pytest.mark.parametrize("raw,clean", [
-    ("Here's an answer:\n\n**Own it.** I did.", "**Own it.** I did."),
+    ("Here's an answer:\n\n**Own it.** I did.", "Own it. I did."),
+    ("- I led six people\n- We shipped on time\n\nI learned a lot.", "I led six people. We shipped on time.\n\nI learned a lot."),
+    ("1. Plan it\n2) Do it", "Plan it. Do it."),
+    ("## My answer\nI led {{team size}} people.", "My answer\nI led team size people."),
+    ("A bullet-free answer with a dash - in the middle.", "A bullet-free answer with a dash - in the middle."),
     ("Sure! Here is a draft:\nI led the team.", "I led the team."),
     ('"I led the team and learned a lot."', "I led the team and learned a lot."),
     ("\u201cI led the team.\u201d", "I led the team."),
@@ -395,5 +399,5 @@ def test_tidy_draft(raw, clean):
 def test_the_finished_draft_is_tidied_but_streaming_is_untouched():
     h = hook(chunk("Here's an answer:\n"), chunk("**Own it.** "), chunk("Done."))
     ev = run(g.Generator({"generate": True}, lambda *a: None, http=h))
-    assert ev[-1][1]["text"] == "**Own it.** Done."
+    assert ev[-1][1]["text"] == "Own it. Done."
     assert "".join(d for k, d in ev if k == "delta").startswith("Here's an answer:")      # the screen swaps in the clean text at the end

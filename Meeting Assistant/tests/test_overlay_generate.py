@@ -1,4 +1,4 @@
-"""Drafted answers in the overlay: question beside the answer, streaming, gap filling, failures. Headless."""
+"""Drafted answers in the overlay: question | prepared | generated side by side, streaming, failures. Headless."""
 import gc
 import json
 import os
@@ -19,7 +19,7 @@ from matcher import Matcher  # noqa: E402
 from test_generate import FakeClient, _api_error  # noqa: E402
 from test_overlay_ui import FakeListener, body, pump, ready, say  # noqa: E402
 
-DRAFT = ["**I lead by listening first.** ", "On my last team I {{team size}} people ", "and kept everyone aligned."]
+DRAFT = ["I lead by listening first. ", "On my last team, which was about six people, ", "I kept everyone aligned."]
 DRAFT_TEXT = "".join(DRAFT)
 
 
@@ -66,32 +66,49 @@ def drafted(o):
     return o.gen_state == "done"
 
 
+def gbody(o):
+    return o.gtext.get("1.0", "end").strip()
+
+
 def last_prompt(holder):
     return holder.client.calls[-1]["messages"][0]["content"]
 
 
-def test_question_sits_beside_the_answer(ov):
+def test_question_prepared_and_generated_sit_side_by_side(ov):
     ready(ov)
     ov.root.update()
-    assert ov.heard.winfo_rootx() + ov.heard.winfo_width() <= ov.text.winfo_rootx() + 2      # left of it, not above it
-    top, bottom = ov.text.winfo_rooty(), ov.text.winfo_rooty() + ov.text.winfo_height()
-    assert top - 40 <= ov.heard.winfo_rooty() <= bottom                                        # in the same band
-    assert ov.right.winfo_rootx() > ov.left.winfo_rootx()
+    left, mid, right = ov.heard, ov.text, ov.gtext
+    assert left.winfo_rootx() + left.winfo_width() <= mid.winfo_rootx() + 2          # question, then prepared...
+    assert mid.winfo_rootx() + mid.winfo_width() <= right.winfo_rootx() + 2          # ...then generated
+    assert abs(mid.winfo_rooty() - right.winfo_rooty()) <= 2 and abs(mid.winfo_height() - right.winfo_height()) <= 2
+    assert mid.winfo_ismapped() and right.winfo_ismapped()
+    assert abs(mid.winfo_width() - right.winfo_width()) < 0.35 * mid.winfo_width()    # a fair share each
 
 
-def test_prepared_answer_shows_at_once_then_the_draft_streams_in(ov, holder):
+def test_both_answers_are_on_screen_at_the_same_time(ov):
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    assert "Lead answer: I led" in body(ov)                                            # prepared (its own ⚠ highlight is fine)
+    assert gbody(ov) == DRAFT_TEXT.strip()                                              # generated, in the next column
+    assert ov.text.winfo_ismapped() and ov.gtext.winfo_ismapped()
+    assert ov.prep_status.cget("text") == "from your bank: demo"
+    assert not hasattr(ov, "tab_gen") and not hasattr(ov, "tab_prep")                  # no tabs to flip between
+
+
+def test_prepared_shows_at_once_and_stays_while_the_draft_streams_in(ov, holder):
     holder.client = FakeClient(pieces=DRAFT, delay=0.15)
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
-    assert pump(ov, lambda: "Lead" in body(ov) and ov.gen_state == "drafting")                 # instant: the prepared one
-    assert ov.view == "prepared" or ov.gen_text == ""
-    assert pump(ov, lambda: ov.view == "generated" and ov.gen_text)                             # first words arrive
+    assert pump(ov, lambda: "Lead answer" in body(ov) and ov.gen_state == "drafting")
+    assert pump(ov, lambda: gbody(ov).startswith("I lead by listening") and ov.gen_state == "drafting")   # partway through...
+    assert "Lead answer: I led" in body(ov)                                             # ...both are visible
     assert pump(ov, lambda: drafted(ov))
-    assert body(ov) == "I lead by listening first. On my last team I ⚠ team size people and kept everyone aligned."
-    assert ov.gen_status.cget("text").startswith("✨ adapted from your prepared answer")
-    assert "Tell me about a time you led a team" in ov.heard.cget("text")                      # the question, left of it
-    assert ov.question.cget("text") == "Tell me about a time you led a team"                   # closest prepared question
-    assert str(ov.tab_gen.cget("state")) == "normal" and ov.save_btn.cget("state") == "normal"
+    assert "Lead answer: I led" in body(ov)                                             # the prepared one never moved
+    assert ov.gen_status.cget("text").startswith("adapted from your prepared answer")
+    assert "Tell me about a time you led a team" in ov.heard.cget("text")
+    assert ov.question.cget("text") == "Tell me about a time you led a team"
+    assert ov.save_btn.cget("state") == "normal"
 
 
 def test_prompt_carries_the_question_and_the_prepared_answer(ov, holder):
@@ -104,14 +121,25 @@ def test_prompt_carries_the_question_and_the_prepared_answer(ov, holder):
     assert holder.client.calls[0]["model"] == "claude-opus-5-5"
 
 
-def test_tabs_flip_between_generated_and_prepared(ov):
+def test_the_draft_never_shows_bullets_bold_or_yellow_highlights(ov, holder):
+    holder.client = FakeClient(pieces=["- I led **six** people\n", "- we shipped on time\n\n", "I learned that {{lesson}} matters."])
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     assert pump(ov, lambda: drafted(ov))
-    ov.tab_prep.invoke()
-    assert "Lead answer: I led" in body(ov) and ov.view == "prepared"
-    ov.tab_gen.invoke()
-    assert body(ov).startswith("I lead by listening first") and ov.view == "generated"
+    text = gbody(ov)
+    assert text == "I led six people. we shipped on time.\nI learned that lesson matters."     # prose; one paragraph per line
+    for bad in ("•", "- ", "**", "{{", "⚠"):
+        assert bad not in text
+    assert ov.gtext.tag_ranges("ph") == () and ov.gtext.tag_ranges("b") == ()           # nothing highlighted or bold
+    assert "Lead answer" in body(ov) and ov.text.tag_ranges("ph")                       # the PREPARED answer keeps its own
+
+
+def test_paragraphs_stay_paragraphs(ov, holder):
+    holder.client = FakeClient(pieces=["First thought, said plainly.\n\n", "Second thought follows."])
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    assert gbody(ov).split("\n") == ["First thought, said plainly.", "Second thought follows."]
 
 
 def test_no_prepared_answer_fits_so_the_gap_is_filled(ov, holder):
@@ -119,9 +147,10 @@ def test_no_prepared_answer_fits_so_the_gap_is_filled(ov, holder):
     say(ov, "What is your experience with Kubernetes deployments and monitoring?", utt=1)
     assert pump(ov, lambda: drafted(ov))
     assert ov.question.cget("text") == "No close prepared answer"
-    assert ov.view == "generated" and body(ov).startswith("I lead by listening first")
+    assert body(ov) == "No prepared answer matches this question." and not ov.text.tag_ranges("ph")
+    assert gbody(ov) == DRAFT_TEXT.strip()
     p = last_prompt(holder)
-    assert "Kubernetes deployments" in p and "{{placeholder}}" not in p
+    assert "Kubernetes deployments" in p
     assert "None of the prepared answers" in p or "loosely related" in p or "related match" in p
     assert "no prepared answer matched" in ov.gen_status.cget("text") or "blended" in ov.gen_status.cget("text")
 
@@ -132,6 +161,7 @@ def test_statements_are_not_drafted(ov, holder):
     assert pump(ov, lambda: ov.heard.cget("text").startswith("Heard: “Thanks"))
     time.sleep(0.3)
     assert holder.client.calls == [] and ov.gen_state == "idle"
+    assert gbody(ov) == "A tailored answer will appear here for each question."
 
 
 def test_early_guess_confirmed_by_the_final_costs_one_call(ov, holder):
@@ -153,7 +183,8 @@ def test_a_different_final_supersedes_the_early_draft(ov, holder):
     say(ov, "What is your biggest weakness?", final=True, utt=1)
     assert pump(ov, lambda: ov.gen_state == "done" and ov.gen_text == "Weakness answer.")
     assert ov.question.cget("text") == "What is your biggest weakness?"
-    assert "Early" not in body(ov)
+    assert "WEAK answer" in body(ov) and gbody(ov) == "Weakness answer."
+    assert "Early" not in gbody(ov)
 
 
 def test_follow_up_is_drafted_from_the_previous_answer(ov, holder):
@@ -166,10 +197,8 @@ def test_follow_up_is_drafted_from_the_previous_answer(ov, holder):
     p = last_prompt(holder)
     assert "follow-up (asking for more detail) to an earlier question: Tell me about a time you led a team" in p
     assert "I led {{N}} people." in p
-    # the parent answer stays up as the prepared one: a follow-up must not wipe the left pane
-    assert ov.question.cget("text") == "Tell me about a time you led a team"
-    ov.tab_prep.invoke()
-    assert "Lead answer: I led" in body(ov)
+    assert ov.question.cget("text") == "Tell me about a time you led a team"            # the parent stays up as the prepared one
+    assert "Lead answer: I led" in body(ov) and gbody(ov) == DRAFT_TEXT.strip()          # and both columns are still showing
 
 
 def test_failure_leaves_the_prepared_answer_alone_and_stops_retrying(ov, holder):
@@ -177,12 +206,12 @@ def test_failure_leaves_the_prepared_answer_alone_and_stops_retrying(ov, holder)
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     assert pump(ov, lambda: ov.gen_state == "error")
-    assert "key was rejected" in ov.gen_status.cget("text") and "Lead" in body(ov) and ov.view == "prepared"
-    assert str(ov.tab_gen.cget("state")) == "disabled"
+    assert "key was rejected" in ov.gen_status.cget("text") and "key was rejected" in gbody(ov)
+    assert "Lead answer" in body(ov)                                                    # the prepared answer is untouched
     say(ov, "What is your biggest weakness?", utt=2)
     assert pump(ov, lambda: ov.question.cget("text") == "What is your biggest weakness?")
     assert pump(ov, lambda: ov.gen_state in ("off", "error"))
-    assert len(holder.client.calls) == 1 and "WEAK answer" in body(ov)       # no second request
+    assert len(holder.client.calls) == 1 and "WEAK answer" in body(ov)                 # no second request
 
 
 def test_missing_package_is_explained_on_screen(banks_dir, monkeypatch):
@@ -200,7 +229,7 @@ def test_missing_package_is_explained_on_screen(banks_dir, monkeypatch):
         ready(o)
         say(o, "What is your biggest weakness?", utt=1)
         assert pump(o, lambda: "pip install anthropic" in o.gen_status.cget("text"))
-        assert "WEAK answer" in body(o)
+        assert "pip install anthropic" in gbody(o) and "WEAK answer" in body(o)
     finally:
         o._quit()
 
@@ -209,14 +238,15 @@ def test_draft_toggle_switches_it_off_and_remembers(ov, holder):
     ready(ov)
     ov.gen_btn.invoke()
     assert ov.gen_btn.cget("text") == "✨ Draft: off" and json.loads(b.CONFIG_PATH.read_text())["generate"] is False
+    assert "switched off" in gbody(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     assert pump(ov, lambda: "Lead" in body(ov))
     time.sleep(0.3)
-    assert holder.client.calls == [] and str(ov.tab_gen.cget("state")) == "disabled"
+    assert holder.client.calls == [] and "switched off" in gbody(ov)
     ov.gen_btn.invoke()
     assert ov.gen_btn.cget("text") == "✨ Draft: on"
     say(ov, "What is your biggest weakness?", utt=2)
-    assert pump(ov, lambda: drafted(ov))
+    assert pump(ov, lambda: drafted(ov)) and gbody(ov) == DRAFT_TEXT.strip()
 
 
 def test_regenerate_asks_again(ov, holder):
@@ -226,7 +256,7 @@ def test_regenerate_asks_again(ov, holder):
     holder.client = FakeClient(pieces=["Second ", "take."])
     ov.regen_btn.invoke()
     assert pump(ov, lambda: ov.gen_state == "done" and ov.gen_text == "Second take.")
-    assert len(holder.client.calls) == 1 and body(ov) == "Second take."
+    assert len(holder.client.calls) == 1 and gbody(ov) == "Second take." and "Lead answer" in body(ov)
 
 
 def test_save_turns_the_draft_into_a_prepared_answer(ov, holder):
@@ -239,7 +269,8 @@ def test_save_turns_the_draft_into_a_prepared_answer(ov, holder):
     assert saved.question == "Tell me about a time you led a team?" and saved.tags == ["generated"]
     assert saved.response == DRAFT_TEXT.strip()
     assert ov.save_btn.cget("state") == "disabled"
-    ov.gen_state = "done"; ov._refresh_gen_ui()
+    ov.gen_state = "done"
+    ov._refresh_gen_ui()
     ov._save_generated()                                                    # the same question twice is refused
     assert "already in the bank" in ov.gen_status.cget("text")
     assert len([e for e in b.load_bank("demo").entries if e.question.startswith("Tell me about a time")]) == 2
@@ -254,9 +285,9 @@ def test_picking_an_answer_by_hand_stops_the_draft(ov, holder):
     job = ov.gen._job
     ov._pick_entry(es[2])
     assert ov.gen._job != job                                    # the Generator itself was told to stop (no wasted tokens)
-    assert pump(ov, lambda: ov.view == "prepared" and "WEAK answer" in body(ov))
+    assert pump(ov, lambda: "WEAK answer" in body(ov))
     time.sleep(0.4)
-    assert ov.gen_text == "" and ov.gen_state == "idle"
+    assert ov.gen_text == "" and ov.gen_state == "idle" and gbody(ov).startswith("A tailored answer")
 
 
 def test_groq_draft_streams_beside_the_prepared_answer_and_names_its_model(ov):
@@ -264,7 +295,7 @@ def test_groq_draft_streams_beside_the_prepared_answer_and_names_its_model(ov):
 
     def http(payload):
         sent.append(payload)
-        for piece in ("**Listen first.** ", "Then {{your example}}."):
+        for piece in ("Listening first has always worked for me. ", "Then I check in with everyone."):
             yield json.dumps({"choices": [{"delta": {"content": piece}, "finish_reason": None}]})
         yield json.dumps({"choices": [], "usage": {"prompt_tokens": 600, "completion_tokens": 20}})
         yield "[DONE]"
@@ -272,10 +303,10 @@ def test_groq_draft_streams_beside_the_prepared_answer_and_names_its_model(ov):
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     assert pump(ov, lambda: drafted(ov))
-    assert body(ov) == "Listen first. Then ⚠ your example."
+    assert gbody(ov) == "Listening first has always worked for me. Then I check in with everyone."
+    assert "Lead answer" in body(ov)
     assert ov.gen_status.cget("text").endswith("llama-3.3-70b-versatile")
     assert sent[0]["messages"][0]["role"] == "system" and "led a team" in sent[0]["messages"][1]["content"]
-    assert "Lead answer" in sent[0]["messages"][1]["content"] or "I led {{N}} people." in sent[0]["messages"][1]["content"]
 
 
 def test_stream_safe_hides_unfinished_markers(ov):
@@ -284,11 +315,27 @@ def test_stream_safe_hides_unfinished_markers(ov):
     assert f("I led {{team") == "I led " and f("I led {{team}} fine") == "I led {{team}} fine"
 
 
+def test_half_streamed_markers_never_flash_on_screen(ov, holder):
+    holder.client = FakeClient(pieces=["I led {{te", "am size}} people and **kept ", "them** aligned."], delay=0.12)
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    seen = set()
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not drafted(ov):
+        ov.root.update()
+        seen.add(gbody(ov))
+        time.sleep(0.01)
+    assert drafted(ov) and gbody(ov) == "I led team size people and kept them aligned."
+    assert not any("{{" in t or "**" in t for t in seen)
+
+
 def test_a_long_draft_does_not_freeze_the_window(ov, holder):
     holder.client = FakeClient(pieces=[f"word{i} " for i in range(400)], delay=0.002)
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     t0, ticks = time.monotonic(), 0
     while not drafted(ov) and time.monotonic() - t0 < 5:
-        ov.root.update(); ticks += 1; time.sleep(0.005)
-    assert drafted(ov) and body(ov).count("word") == 400 and ticks > 20
+        ov.root.update()
+        ticks += 1
+        time.sleep(0.005)
+    assert drafted(ov) and gbody(ov).count("word") == 400 and ticks > 20

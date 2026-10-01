@@ -194,7 +194,7 @@ def test_generate_show_prompt_discloses_what_is_sent(gen_cli, capsys, monkeypatc
     _fake_generator(monkeypatch)
     app.main(["generate", "What is your biggest weakness?", "--show-prompt"])
     out = capsys.readouterr().out
-    assert "=== SYSTEM ===" in out and "Never invent personal facts" in out
+    assert "=== SYSTEM ===" in out and "Never write placeholders" in out
     assert "=== MESSAGE ===" in out and "<question>\nWhat is your biggest weakness?\n</question>" in out and "WEAK" in out
 
 
