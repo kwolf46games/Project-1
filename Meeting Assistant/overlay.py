@@ -15,6 +15,8 @@ def prevent_window_capture(hwnd):
 
 
 
+import gc
+import math
 import queue
 import re
 import threading
@@ -23,13 +25,12 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 import bank as bankmod
-from audio import Listener
-from matcher import Match, Matcher, looks_like_question
+from audio import Heard, Listener
+from followup import STRONG_MARGIN, Conversation, Decision
+from matcher import Match, Matcher, bank_vocabulary
 from theme import ACCENT, BAD, BG, FG, GOOD, HOVER_BG, MUTED, PANEL, PLACEHOLDER_BG, WARN, enable_dpi_awareness
 
-JOIN_WINDOW_SEC = 4.0
-STRONG_MARGIN = 0.06  # score >= threshold + this shows even if it doesn't sound like a question
-GUESS_MARGIN = 0.08   # below threshold by up to this, a question gets "Not sure" suggestions
+FOLLOW_ARM_SEC = 20  # how long the "↳ Follow-up" button stays armed
 
 
 class Overlay:
@@ -37,8 +38,14 @@ class Overlay:
         self.cfg = bankmod.load_config()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.matcher: Matcher | None = None
+        self.conv: Conversation | None = None
         self.current: list[Match] = []
-        self.pending: tuple[str, float] | None = None
+        self.heard_q: queue.Queue[Heard | None] = queue.Queue()
+        self._early_shown: set[int] = set()   # utterances whose answer an early guess already put on screen
+        self._forced_until = 0.0              # "↳ Follow-up" button armed until this time
+        self._unsure_text = ""                # what was heard when we weren't sure (for "Remember this wording")
+        self.matcher_error = ""               # why matching is unavailable (shown instead of "Listening")
+        self._timers: list[str] = []
         self._reload_lock = threading.Lock()
 
         enable_dpi_awareness()
@@ -58,11 +65,12 @@ class Overlay:
         self.title_f = tkfont.Font(family="Segoe UI Semibold", size=self.cfg["font_size"] + 2)
 
         self._build()
-        self.listener = Listener(self.cfg, lambda t: self.events.put(("text", t)),
-                                 lambda s: self.events.put(("status", s)))
+        self.listener = Listener(self.cfg, self.heard_q.put, lambda s: self.events.put(("status", s)))
         self._reload_banks()
+        self._match_thread = threading.Thread(target=self._match_loop, daemon=True)
+        self._match_thread.start()
         self.listener.start()
-        self.root.after(50, self._pump)
+        self._timers = [self.root.after(20, self._pump), self.root.after(250, self._tick)]
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
     # ---------- layout ----------
@@ -78,6 +86,13 @@ class Overlay:
         self.dot.pack(side="left")
         self.status = tk.Label(status_row, text="Starting…", fg=MUTED, bg=BG, font=self.small, anchor="w")
         self.status.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.quiet = tk.Label(status_row, text="", fg=MUTED, bg=BG, font=self.small)
+        self.quiet.pack(side="right", padx=(4, 0))
+        mw, mh = int(64 * self.scale), int(8 * self.scale)
+        self.meter = tk.Canvas(status_row, width=mw, height=mh, bg=PANEL, highlightthickness=0)
+        self.meter.pack(side="right", padx=(4, 0))
+        self._meter_bar = self.meter.create_rectangle(0, 0, 0, mh, fill=GOOD, width=0)
+        self._meter_w = mw
 
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", padx=10, pady=(0, 4))
@@ -91,6 +106,8 @@ class Overlay:
         self._btn(top, "↻ Audio", self._restart_audio).pack(side="right", padx=2)
         self.pause_btn = self._btn(top, "❚❚ Pause", self._toggle_pause)
         self.pause_btn.pack(side="right", padx=2)
+        self.follow_btn = self._btn(top, "↳ Follow-up", self._toggle_follow)
+        self.follow_btn.pack(side="right", padx=2)
 
         self.heard = tk.Label(self.root, text="Heard: —", fg=MUTED, bg=BG, font=self.small,
                               anchor="w", justify="left", wraplength=520)
@@ -104,6 +121,13 @@ class Overlay:
                                  anchor="w", justify="left", wraplength=450)
         self.question.pack(side="left", fill="x", expand=True)
 
+        self.notes = tk.Frame(self.root, bg=BG)   # follow-up banner + hint; takes no room while empty
+        self.notes.pack(fill="x", padx=12)
+        self.banner = tk.Label(self.notes, text="", fg=WARN, bg=BG, font=self.small, anchor="w",
+                               justify="left", wraplength=520)
+        self.hint = tk.Label(self.notes, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
+                             justify="left", wraplength=520)
+
         self.skeleton = tk.Label(self.root, text="", fg=ACCENT, bg=BG, font=self.small, anchor="w",
                                  justify="left", wraplength=520)
         self.skeleton.pack(fill="x", padx=12, pady=(0, 6))
@@ -115,6 +139,8 @@ class Overlay:
         self.search.pack(side="left", fill="x", expand=True, padx=6, ipady=3)
         self.alts = tk.Frame(self.root, bg=BG)
         self.alts.pack(side="bottom", fill="x", padx=10, pady=(6, 2))
+        self.likely = tk.Frame(self.root, bg=BG)
+        self.likely.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
 
         body = tk.Frame(self.root, bg=PANEL)
         body.pack(fill="both", expand=True, padx=10)
@@ -135,9 +161,23 @@ class Overlay:
         self.root.bind("<Control-f>", lambda e: self.search.focus_set())
         self.root.bind("<Configure>", self._rewrap)
 
+    def _set_notes(self, banner: str = "", hint: str = "") -> None:
+        self.banner.configure(text=banner)
+        self.hint.configure(text=hint)
+        self.banner.pack_forget()
+        self.hint.pack_forget()
+        if banner:
+            self.banner.pack(fill="x")
+        if hint:
+            self.hint.pack(fill="x")
+        if not (banner or hint):
+            self.notes.configure(height=1)   # Tk keeps a frame's old size once its last child leaves
+
     def _rewrap(self, _e=None) -> None:
         w = max(300, self.root.winfo_width() - 40)
         self.heard.configure(wraplength=w)
+        self.banner.configure(wraplength=w)
+        self.hint.configure(wraplength=w)
         self.skeleton.configure(wraplength=w)
         self.question.configure(wraplength=w - int(90 * self.scale))
 
@@ -148,71 +188,156 @@ class Overlay:
                 kind, val = self.events.get_nowait()
                 if kind == "status":
                     self._set_status(str(val))
-                elif kind == "text":
-                    self._on_heard(str(val))
+                elif kind == "heard":
+                    self._set_heard(val.text, val)
+                elif kind == "decision":
+                    self._apply(*val)
                 elif kind == "reload":
                     self._reload_banks()
                 elif kind == "matcher_ready":
+                    self.matcher_error = ""
                     self._set_status(self.status.cget("text"))
+                elif kind == "matcher_failed":
+                    self.matcher_error = str(val)
+                    self._set_status(self.status.cget("text"))
+                elif kind == "forced_off":
+                    self._forced_style(False)
         except queue.Empty:
             pass
-        self.root.after(50, self._pump)
+        self._timers[0] = self.root.after(20, self._pump)
+
+    def _tick(self) -> None:
+        """A few times a second: the level meter, and a hint if nothing has been heard for a long while."""
+        st = self.listener.stats()
+        level = st["level"] if not self.listener.paused.is_set() else 0.0
+        frac = min(1.0, max(0.0, (20 * math.log10(max(level, 1e-5)) + 55) / 50))
+        self.meter.coords(self._meter_bar, 0, 0, int(self._meter_w * frac), self.meter.winfo_height())
+        live = st["model_ready"] and st["device"] and not self.listener.paused.is_set() and not st["error"]
+        self.quiet.configure(text=f"no sound for {int(st['quiet_for'])}s" if live and st["quiet_for"] > 30 else "")
+        self._timers[1] = self.root.after(250, self._tick)
 
     def _set_status(self, s: str) -> None:
+        if self.matcher_error:   # nothing works without the matcher, so this outranks "Listening"
+            self.status.configure(text=self.matcher_error)
+            self.dot.configure(fg=BAD)
+            return
         n = len(self.matcher.entries) if self.matcher else 0
+        failed = any(w in s.lower() for w in ("fail", "couldn't", "stopped", "error"))
         suffix = f"  ·  {n} questions" if self.matcher else "  ·  loading bank…"
-        self.status.configure(text=s.split("  ·  ")[0] + ("" if "fail" in s.lower() else suffix))
-        color = BAD if ("fail" in s.lower() or "couldn't" in s.lower()) else (
+        self.status.configure(text=s.split("  ·  ")[0] + ("" if failed else suffix))
+        color = BAD if failed else (
             MUTED if self.listener.paused.is_set() else GOOD if s.startswith("Listening") else WARN)
         self.dot.configure(fg=color)
 
     def _load_matcher(self) -> None:
-        if self.matcher is None:
-            self.matcher = Matcher()
-        self.cfg["active_banks"] = bankmod.load_config()["active_banks"]
-        self.matcher.load(bankmod.active_entries(self.cfg))
+        try:
+            if self.matcher is None:
+                self.matcher = Matcher()
+            self.cfg["active_banks"] = bankmod.load_config()["active_banks"]
+            entries = bankmod.active_entries(self.cfg)
+            self.matcher.load(entries)
+            if self.conv is None:
+                self.conv = Conversation(self.matcher, self.cfg)
+            else:
+                self.conv.refresh()
+            self.listener.set_vocabulary(bank_vocabulary(entries))
+        except Exception as e:  # noqa: BLE001
+            self.events.put(("matcher_failed", f"Question matcher failed to load: {e}"))
+            return
         self.events.put(("matcher_ready", None))
 
-    def _on_heard(self, text: str) -> None:
-        # A mid-question pause splits speech into fragments; glue an unmatched fragment
-        # onto whatever follows it within a few seconds.
-        now = time.monotonic()
-        if self.pending and now - self.pending[1] <= JOIN_WINDOW_SEC:
-            text = f"{self.pending[0]} {text}"
-        self.pending = None
-        self.heard.configure(text=f"Heard: “{text}”")
-        if not self.matcher:
+    # ----- matching (own thread: never blocks the window or the audio) -----
+    def _match_loop(self) -> None:
+        while True:
+            h = self.heard_q.get()
+            if h is None:
+                return
+            try:
+                self._process(h)
+            except Exception as e:  # noqa: BLE001 - keep listening whatever one lookup does
+                self.events.put(("status", f"Couldn't match that ({type(e).__name__}: {e})"))
+
+    def _process(self, h: Heard) -> None:
+        conv = self.conv
+        self._early_shown = {u for u in self._early_shown if u >= h.utt}
+        if conv is None:
+            self.events.put(("heard", h))
             return
-        matches = self.matcher.match(text)
-        if not matches:
+        if h.final and h.repeat and h.utt in self._early_shown:   # the early guess already put this answer up
+            self._early_shown.discard(h.utt)
+            self.events.put(("heard", h))
             return
-        thr = float(self.cfg["match_threshold"])
-        best = matches[0].score
-        is_q = looks_like_question(text)
-        if best >= thr + STRONG_MARGIN or (best >= thr and is_q):
-            self._show(matches)
-            return
-        self.pending = (text[-400:], now)
-        if is_q and best >= thr - GUESS_MARGIN:
-            self._show_alts(matches, label="Not sure. Closest:")
+        forced = h.final and time.monotonic() < self._forced_until
+        d = conv.resolve(h.text, final=h.final, forced=forced, utt=h.utt)
+        if forced:
+            self._forced_until = 0.0
+            self.events.put(("forced_off", None))
+        if not h.final and d.action == "show":
+            self._early_shown.add(h.utt)
+        self.events.put(("decision", (d, h)))
+
+    def _set_heard(self, text: str, h: Heard | None = None) -> None:
+        tail = ""
+        if h is not None:
+            tail = ("" if h.final else " …") + (f"   ({h.lag:.1f}s)" if h.lag else "")
+        self.heard.configure(text=f"Heard: “{text}”{tail}")
+
+    def _apply(self, d: Decision, h: Heard) -> None:
+        self._set_heard(d.heard or h.text, h)
+        if d.action == "show":
+            self._unsure_text = ""
+            self._show(d.matches, d)
+        elif d.action == "unsure":
+            self._unsure_text = d.heard
+            self._show_alts(d.matches, label="Not sure. Closest:")
+        elif d.action == "followup":
+            self._show_followup(d)
 
     def _manual_search(self) -> None:
         q = self.search.get().strip()
         if q and self.matcher:
-            self._show(self.matcher.match(q))
+            matches = self.matcher.match(q)
+            if matches:
+                self._unsure_text = ""
+                if self.conv:
+                    self.conv.pick(matches[0].entry)
+                self._show(matches)
 
     # ---------- rendering ----------
-    def _show(self, matches: list[Match]) -> None:
+    def _show(self, matches: list[Match], d: Decision | None = None, manual: bool = False) -> None:
         self.current = matches
         m = matches[0]
         e = m.entry
         self.question.configure(text=e.question)
         thr = float(self.cfg["match_threshold"])
-        color = GOOD if m.score >= thr + STRONG_MARGIN else WARN if m.score >= thr else BAD
-        self.conf.configure(text=f"{m.score:.0%}", bg=color)
+        if manual:
+            self.conf.configure(text="picked", bg=MUTED)
+        else:
+            color = GOOD if m.score >= thr + STRONG_MARGIN else WARN if m.score >= thr else BAD
+            self.conf.configure(text=f"{m.score:.0%}", bg=color)
+        self._set_notes(d.banner if d else "", d.hint if d else "")
         self.skeleton.configure(text=f"Skeleton: {e.skeleton}" if e.skeleton else "")
         self._render(e.response)
         self._show_alts(matches[1:], label="Also:")
+        self._show_likely(d.likely if d else (self.conv.followups_of(e) if self.conv else []))
+
+    def _show_followup(self, d: Decision) -> None:
+        """Heard a follow-up with no scripted answer: keep the current answer up and say what is being asked."""
+        self._set_notes(d.banner, d.hint)
+        self._show_likely(d.likely)
+        self._show_alts(d.matches, label="Closest follow-ups:")
+
+    def _show_likely(self, entries) -> None:
+        for w in self.likely.winfo_children():
+            w.destroy()
+        if not entries:
+            return
+        tk.Label(self.likely, text="Likely follow-ups:", fg=MUTED, bg=BG, font=self.small).pack(anchor="w")
+        for e in entries[:4]:
+            q = e.question if len(e.question) < 70 else e.question[:67] + "…"
+            b = self._btn(self.likely, f"↳  {q}", lambda e=e: self._pick_entry(e))
+            b.configure(anchor="w", justify="left")
+            b.pack(fill="x", pady=1)
 
     def _show_alts(self, matches: list[Match], label: str) -> None:
         for w in self.alts.winfo_children():
@@ -228,7 +353,39 @@ class Overlay:
 
     def _pick(self, m: Match) -> None:
         others = [x for x in self.current if x.entry is not m.entry] if self.current else []
+        if self.conv:
+            self.conv.pick(m.entry)
+        self._set_notes()
         self._show([m, *others][:3])
+        self._offer_remember(m.entry)
+
+    def _pick_entry(self, entry) -> None:
+        if self.conv:
+            self.conv.pick(entry)
+        self._unsure_text = ""
+        self._show([Match(entry, 1.0)], manual=True)
+
+    def _offer_remember(self, entry) -> None:
+        """After choosing the right answer from a 'Not sure' list: offer to learn the wording that was heard."""
+        text = self._unsure_text
+        if not text:
+            return
+        short = text if len(text) < 48 else text[:45] + "…"
+        btn = self._btn(self.alts, f"＋ Remember “{short}” as another way to ask this",
+                        lambda: self._remember(entry, text, btn))
+        btn.configure(anchor="w", justify="left")
+        btn.pack(fill="x", pady=(6, 0))
+
+    def _remember(self, entry, text: str, btn: tk.Button) -> None:
+        try:
+            added = bankmod.teach_phrasing(entry, text)
+        except (KeyError, OSError) as e:
+            btn.configure(text=f"Couldn't save that: {e}", state="disabled")
+            return
+        self._unsure_text = ""
+        btn.configure(text="Saved. It will match next time." if added else "Already known.", state="disabled")
+        if added:
+            self._reload_banks()
 
     def _render(self, md: str) -> None:
         t = self.text
@@ -278,6 +435,24 @@ class Overlay:
             self.pause_btn.configure(text="▶ Resume")
             self._set_status("Paused")
 
+    def _toggle_follow(self) -> None:
+        """Arm (or disarm) 'treat the next thing heard as a follow-up to the answer on screen'."""
+        if time.monotonic() < self._forced_until:
+            self._forced_until = 0.0
+            self._forced_style(False)
+            return
+        self._forced_until = time.monotonic() + FOLLOW_ARM_SEC
+        self._forced_style(True)
+        self.root.after(FOLLOW_ARM_SEC * 1000 + 100, self._expire_follow)
+
+    def _expire_follow(self) -> None:
+        if time.monotonic() >= self._forced_until:
+            self._forced_style(False)
+
+    def _forced_style(self, on: bool) -> None:
+        self.follow_btn.configure(text="↳ Listening for follow-up…" if on else "↳ Follow-up",
+                                  bg=ACCENT if on else PANEL, fg=BG if on else FG)
+
     def _restart_audio(self) -> None:
         self._set_status("Reconnecting audio…")
         threading.Thread(target=self.listener.restart, daemon=True).start()
@@ -325,7 +500,18 @@ class Overlay:
         bankmod.save_config(disk)
 
     def _quit(self) -> None:
+        # Tk objects (fonts, variables) must be freed on this thread. If a worker thread dropped the last
+        # reference, or the garbage collector ran there, Tcl would be called from the wrong thread and hang
+        # or abort. So: stop the workers, wait for the one that holds the window, and keep the collector off.
         self.listener.stop()
+        self.heard_q.put(None)
+        self._match_thread.join(timeout=2)
+        gc.disable()
+        for t in self._timers:
+            try:
+                self.root.after_cancel(t)
+            except tk.TclError:
+                pass
         self.root.destroy()
 
     def run(self) -> None:

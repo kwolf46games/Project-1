@@ -2,11 +2,26 @@
 
 File format (hand-editable):
 
-   ptimize the software to be able to identify follow up questions when asked to. As well as better matching for audio to transcript and suggested extra phrasing for each question. It is in my projects folder, meeting assistant.
+    # Bank title                                  (optional)
 
- I am making this to help individuals that are deaf, be able to respond better during virtual meetings
+    ## How would you describe your leadership style?
+    also: how do you lead a team | what kind of leader are you
+    follows: Tell me about yourself               (optional, see below)
+    tags: leadership, behavioral                  (optional)
+    skeleton: one-line outline shown above the answer   (optional)
 
-Everything after the metadata lines is the response body.
+    The response goes here, in plain text.
+    **Bold** marks a line to land, {{double braces}} mark a placeholder to fix.
+
+Metadata lines (also / follows / tags / skeleton) sit directly under the "## question"
+heading; everything after them is the response body.
+
+Follow-up questions
+    "follows:" says this question is a follow-up to another one in the same (or another
+    active) bank, by that question's exact text; separate several with "|".  After the
+    parent's answer is shown, the overlay lists its follow-ups and listens for them with
+    extra confidence.  Tag a question "followup" (no "follows:" needed) for generic
+    follow-ups such as "Can you give me an example?" that can come after any answer.
 """
 from __future__ import annotations
 
@@ -27,9 +42,16 @@ DEFAULT_CONFIG = {
     "silence_seconds": 0.7,
     "font_size": 13,
     "opacity": 0.93,
+    "whisper_prompt": "",
+    "output_device": "",
+    "followups": True,               # recognise follow-up questions using the answer just shown
+    "followup_window_seconds": 120,  # how long an answer stays "the topic" for follow-ups
+    "early_silence_seconds": 0.35,   # start transcribing after this much quiet (0 = wait the full silence_seconds)
+    "reconnect_idle_seconds": 45,    # re-open the audio device after this long with no sound (0 = off)
 }
 
-META_KEYS = ("also", "tags", "skeleton")
+META_KEYS = ("also", "follows", "tags", "skeleton")
+FOLLOWUP_TAGS = {"followup", "followups", "follow-up", "follow-ups", "follow up", "follow ups"}
 
 
 @dataclass
@@ -40,14 +62,22 @@ class Entry:
     tags: list[str] = field(default_factory=list)
     skeleton: str = ""
     bank: str = ""
+    follows: list[str] = field(default_factory=list)   # question text(s) this is a follow-up to
 
     def phrasings(self) -> list[str]:
         return [self.question, *self.also]
+
+    @property
+    def is_generic_followup(self) -> bool:
+        """Tagged "followup": may be asked after any answer ("Can you give me an example?")."""
+        return any(t.strip().lower() in FOLLOWUP_TAGS for t in self.tags)
 
     def to_markdown(self) -> str:
         lines = [f"## {self.question}"]
         if self.also:
             lines.append("also: " + " | ".join(self.also))
+        if self.follows:
+            lines.append("follows: " + " | ".join(self.follows))
         if self.tags:
             lines.append("tags: " + ", ".join(self.tags))
         if self.skeleton:
@@ -85,6 +115,11 @@ class Bank:
             raise KeyError(f"No question matching '{query}' in '{self.name}'.")
         raise KeyError(f"'{query}' matches {len(hits)} questions; be more specific or use the number.")
 
+    def rename_question(self, old: str, new: str) -> None:
+        """Keep "follows:" links working when a question's wording changes."""
+        for e in self.entries:
+            e.follows = [new if f.strip().lower() == old.strip().lower() else f for f in e.follows]
+
 
 def _write_atomic(path: Path, text: str) -> None:
     """Write via a temp file + rename so readers never see a half-written file."""
@@ -106,12 +141,14 @@ def parse_markdown(text: str, name: str) -> Bank:
         entry = Entry(question=lines[0].strip(), bank=name)
         i = 1
         while i < len(lines):
-            m = re.match(r"^(also|tags|skeleton):\s*(.*)$", lines[i], flags=re.I)
+            m = re.match(r"^(also|follows|tags|skeleton):\s*(.*)$", lines[i], flags=re.I)
             if not m:
                 break
             key, val = m.group(1).lower(), m.group(2).strip()
             if key == "also":
                 entry.also = [p.strip() for p in val.split("|") if p.strip()]
+            elif key == "follows":
+                entry.follows = [p.strip() for p in val.split("|") if p.strip()]
             elif key == "tags":
                 entry.tags = [t.strip() for t in val.split(",") if t.strip()]
             else:
@@ -128,6 +165,7 @@ COLUMN_NAMES = {
     "question": ("question", "questions", "q", "prompt", "interview question"),
     "response": ("response", "responses", "answer", "answers", "a", "script", "my answer", "sample answer"),
     "also": ("also", "other phrasings", "phrasings", "alternates", "variations"),
+    "follows": ("follows", "follow-up to", "follow up to", "followup to", "follows up", "parent", "parent question"),
     "tags": ("tags", "tag", "category", "type", "topic"),
     "skeleton": ("skeleton", "outline", "summary", "key points"),
 }
@@ -154,7 +192,8 @@ def _rows_to_bank(rows: list[list[str]], name: str) -> Bank:
     header = [h.lower() for h in rows[0]]
     cols = {key: next((i for i, h in enumerate(header) if h in names), None) for key, names in COLUMN_NAMES.items()}
     if cols["question"] is None:
-        cols = {"question": 0, "response": 1 if len(rows[0]) > 1 else None, "also": None, "tags": None, "skeleton": None}
+        cols = {"question": 0, "response": 1 if len(rows[0]) > 1 else None, "also": None, "follows": None,
+                "tags": None, "skeleton": None}
     else:
         rows = rows[1:]
     if cols["response"] is None:
@@ -171,6 +210,7 @@ def _rows_to_bank(rows: list[list[str]], name: str) -> Bank:
             bank.entries.append(Entry(
                 question=q, response=get(row, "response"),
                 also=[p.strip() for p in re.split(r"[|\n]", get(row, "also")) if p.strip()],
+                follows=[p.strip() for p in re.split(r"[|\n]", get(row, "follows")) if p.strip()],
                 tags=[t.strip() for t in get(row, "tags").split(",") if t.strip()],
                 skeleton=get(row, "skeleton"), bank=name,
             ))
@@ -329,7 +369,7 @@ def import_file(path: Path, name: str) -> Bank:
     ext = path.suffix.lower()
     if ext in (".md", ".txt"):
         text = path.read_text(encoding="utf-8-sig")
-        if re.search(r"^(also|tags|skeleton):", text, re.M | re.I):
+        if re.search(r"^(also|follows|tags|skeleton):", text, re.M | re.I):
             return parse_markdown(text, name)  # this app's own format, with metadata
         return _blocks_to_bank(_text_blocks(text), name)
     if ext == ".csv":
@@ -380,6 +420,24 @@ def load_bank(name: str) -> Bank:
     if not path.exists():
         raise KeyError(f"No bank named '{name}'. Existing: {', '.join(bank_names()) or '(none)'}")
     return parse_markdown(path.read_text(encoding="utf-8"), name)
+
+
+def teach_phrasing(entry: Entry, text: str) -> bool:
+    """Save `text` as another way to ask `entry`'s question. Returns False if it was already known."""
+    text = " ".join(text.split())
+    if not text:
+        return False
+    bk = load_bank(entry.bank)
+    for e in bk.entries:
+        if e.question == entry.question:
+            known = {p.strip().lower() for p in e.phrasings()}
+            if text.lower() in known:
+                return False
+            e.also.append(text)
+            entry.also = list(e.also)   # keep the in-memory entry in step with the file
+            bk.save()
+            return True
+    raise KeyError(f"'{entry.question}' is no longer in bank '{entry.bank}'.")
 
 
 def active_entries(cfg: dict | None = None) -> list[Entry]:

@@ -3,6 +3,7 @@ and test how a spoken question would match. Opens standalone or from the overlay
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -11,6 +12,7 @@ from tkinter import font as tkfont
 from typing import Callable
 
 import bank as b
+import suggest as sg
 from theme import ACCENT, BAD, BG, FG, GOOD, HOVER_BG, MUTED, PANEL, SELECT_BG, WARN, enable_dpi_awareness
 
 FILE_TYPES = [
@@ -36,6 +38,7 @@ class BankManager:
         self.matcher_provider = matcher_provider
         self._own_matcher = None
         self._matcher_dirty = False
+        self._ui_calls: queue.Queue = queue.Queue()   # work finished on background threads, run on the window's thread
         if master is None:
             enable_dpi_awareness()
             self.win: tk.Tk | tk.Toplevel = tk.Tk()
@@ -55,6 +58,7 @@ class BankManager:
         self._style()
         self._build()
         self.refresh_banks()
+        self._drain_id = self.win.after(50, self._drain_ui)
 
     # ---------- look ----------
     def _style(self) -> None:
@@ -66,6 +70,13 @@ class BankManager:
         st.configure("Treeview.Heading", background=BG, foreground=MUTED, relief="flat", font=self.fs)
         st.map("Treeview.Heading", background=[("active", BG)])
         st.configure("Vertical.TScrollbar", background=PANEL, troughcolor=BG, borderwidth=0, arrowcolor=MUTED)
+        st.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=MUTED,
+                     bordercolor=PANEL, lightcolor=PANEL, darkcolor=PANEL, selectbackground=SELECT_BG,
+                     selectforeground=FG)
+        st.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", FG)])
+        self.win.option_add("*TCombobox*Listbox.background", PANEL)
+        self.win.option_add("*TCombobox*Listbox.foreground", FG)
+        self.win.option_add("*TCombobox*Listbox.selectBackground", SELECT_BG)
 
     def _btn(self, parent, text, cmd, primary=False):
         return tk.Button(parent, text=text, command=cmd, bg=ACCENT if primary else PANEL,
@@ -138,14 +149,17 @@ class BankManager:
         self._btn(qbtns, "＋ Add question", self.add_question, True).pack(side="left", padx=(0, 4))
         self._btn(qbtns, "Edit", self.edit_question).pack(side="left", padx=4)
         self._btn(qbtns, "Delete", self.delete_question).pack(side="left", padx=4)
+        self._btn(qbtns, "✨ Suggest phrasings", self.suggest_all).pack(side="left", padx=4)
         self._label(qbtns, "Tip: double-click a question to edit it.", self.fs, MUTED).pack(side="left", padx=10)
         qframe = tk.Frame(right, bg=BG)
         qframe.pack(fill="both", expand=True)
-        self.questions = ttk.Treeview(qframe, columns=("q", "alts"), show="headings", selectmode="browse")
+        self.questions = ttk.Treeview(qframe, columns=("q", "alts", "fu"), show="headings", selectmode="browse")
         self.questions.heading("q", text="Question")
         self.questions.heading("alts", text="Other phrasings")
-        self.questions.column("q", width=int(420 * self.scale), stretch=True)
-        self.questions.column("alts", width=int(110 * self.scale), anchor="center", stretch=False)
+        self.questions.heading("fu", text="Follow-up of")
+        self.questions.column("q", width=int(380 * self.scale), stretch=True)
+        self.questions.column("alts", width=int(100 * self.scale), anchor="center", stretch=False)
+        self.questions.column("fu", width=int(170 * self.scale), anchor="w", stretch=False)
         sb = ttk.Scrollbar(qframe, orient="vertical", command=self.questions.yview)
         self.questions.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -302,7 +316,9 @@ class BankManager:
         for i, e in enumerate(bk.entries):
             hay = " ".join([e.question, *e.also, e.response]).lower()
             if not needle or needle in hay:
-                self.questions.insert("", "end", iid=str(i), values=(e.question, len(e.also) or "—"))
+                fu = ("any answer" if e.is_generic_followup and not e.follows else
+                      " | ".join(e.follows) if e.follows else "—")
+                self.questions.insert("", "end", iid=str(i), values=(e.question, len(e.also) or "—", fu))
 
     def _selected_entry(self) -> tuple[b.Bank, int] | None:
         name, sel = self.selected_bank(), self.questions.selection()
@@ -334,7 +350,10 @@ class BankManager:
 
         def save(entry: b.Entry) -> None:
             fresh = b.load_bank(bk.name)
+            old = fresh.entries[i].question
             fresh.entries[i] = entry
+            if old != entry.question:
+                fresh.rename_question(old, entry.question)   # keep "follows:" links pointing at it
             fresh.save()
             self.refresh_questions()
             self.questions.selection_set(str(i))
@@ -351,6 +370,41 @@ class BankManager:
             bk.save()
             self.refresh_banks(select=bk.name)
             self._changed()
+
+    # ---------- background work ----------
+    def call_ui(self, fn: Callable[[], None]) -> None:
+        """Safe to call from any thread: `fn` runs on the window's own thread shortly after."""
+        self._ui_calls.put(fn)
+
+    def _drain_ui(self) -> None:
+        while True:
+            try:
+                fn = self._ui_calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:   # the dialog was closed while the work was running
+                pass
+        self._drain_id = self.win.after(50, self._drain_ui)
+
+    # ---------- suggested phrasings ----------
+    def vet_async(self, items, entry, done, min_sim: float = 0.80) -> None:
+        """Check suggestions against the real matcher in the background, then call done(vetted or None)."""
+        def work():
+            try:
+                vetted = sg.vet(items, entry, self._matcher(), min_sim)
+            except Exception:  # noqa: BLE001 - model unavailable: keep the unchecked suggestions
+                vetted = None
+            self.call_ui(lambda: done(vetted))
+        threading.Thread(target=work, daemon=True).start()
+
+    def suggest_all(self) -> None:
+        name = self.selected_bank()
+        if not name:
+            messagebox.showinfo("Suggest phrasings", "Pick a bank first.", parent=self.win)
+            return
+        BulkSuggestDialog(self, b.load_bank(name))
 
     # ---------- tester ----------
     def _matcher(self):
@@ -376,9 +430,10 @@ class BankManager:
         def work():
             try:
                 res = self._matcher().match(text, k=3)
-                self.win.after(0, lambda: self._show_test(res, text))
+                self.call_ui(lambda: self._show_test(res, text))
             except Exception as e:  # noqa: BLE001
-                self.win.after(0, lambda: self._show_test([(f"Test failed: {e}", None)]))
+                msg = f"Test failed: {e}"   # (the name `e` is gone by the time a deferred lambda would run)
+                self.call_ui(lambda: self._show_test([(msg, None)]))
         threading.Thread(target=work, daemon=True).start()
 
     def _show_test(self, results, text: str = "") -> None:
@@ -412,13 +467,11 @@ class BankManager:
         if not messagebox.askyesno("Teach this wording", f"Add “{text}” as another way to ask:\n\n{entry.question}",
                                    parent=self.win):
             return
-        bk = b.load_bank(entry.bank)
-        for e in bk.entries:
-            if e.question == entry.question:
-                if text not in e.also:
-                    e.also.append(text)
-                break
-        bk.save()
+        try:
+            b.teach_phrasing(entry, text)
+        except KeyError as e:
+            messagebox.showerror("Teach this wording", str(e.args[0]), parent=self.win)
+            return
         self.refresh_questions()
         self._changed()
         self._show_test([(f"Added “{text}” as another way to ask: {entry.question}", None)])
@@ -441,8 +494,8 @@ class QuestionEditor:
         d.title(title)
         d.configure(bg=BG)
         d.transient(mgr.win)
-        d.geometry(f"{int(720 * s)}x{int(720 * s)}")
-        d.minsize(int(560 * s), int(560 * s))
+        d.geometry(f"{int(720 * s)}x{int(800 * s)}")
+        d.minsize(int(560 * s), int(640 * s))
         d.grab_set()
         f, fs, fb = mgr.f, mgr.fs, mgr.fb
 
@@ -471,13 +524,25 @@ class QuestionEditor:
 
         label("Question")
         self.q = entry_box(entry.question)
-        label("Other ways it might be asked", "one per line; more = better matching")
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x", pady=(8, 2))
+        tk.Label(row, text="Other ways it might be asked", bg=BG, fg=FG, font=fb).pack(side="left")
+        tk.Label(row, text="one per line; more = better matching", bg=BG, fg=MUTED, font=fs).pack(side="left", padx=8)
+        mgr._btn(row, "✨ Suggest", self.suggest).pack(side="right")
         self.also = text_box("\n".join(entry.also), 4)
+        label("Follows up on", "optional: the question this one is a follow-up to")
+        try:
+            parents = [e.question for e in b.load_bank(entry.bank).entries if e.question != entry.question] if entry.bank else []
+        except KeyError:
+            parents = []
+        self.follows = ttk.Combobox(body, values=[""] + parents, font=f)
+        self.follows.set(" | ".join(entry.follows))
+        self.follows.pack(fill="x", ipady=3)
         label("Response", "**bold** = line to land · {{text}} = placeholder to fix")
         self.resp = text_box(entry.response, 12, expand=True)
         label("Skeleton", "optional one-line outline shown above the answer")
         self.skel = entry_box(entry.skeleton)
-        label("Tags", "optional, comma-separated")
+        label("Tags", "optional, comma-separated; tag it “followup” if it can follow any answer")
         self.tags = entry_box(", ".join(entry.tags))
 
         row = tk.Frame(d, bg=BG)
@@ -500,8 +565,223 @@ class QuestionEditor:
             tags=[t.strip() for t in self.tags.get().split(",") if t.strip()],
             skeleton=self.skel.get().strip(),
             bank=self.entry.bank,
+            follows=[p.strip() for p in self.follows.get().split("|") if p.strip()],
         ))
         self.dlg.destroy()
+
+    def suggest(self) -> None:
+        q = self.q.get().strip()
+        if len(q.split()) < 2:
+            messagebox.showinfo("Suggest phrasings", "Type the question first.", parent=self.dlg)
+            return
+        known = [line.strip() for line in self.also.get("1.0", "end").splitlines() if line.strip()]
+        items = sg.generate(q, known, limit=10)
+        if not items:
+            messagebox.showinfo("Suggest phrasings", "No new wordings to suggest for that question.", parent=self.dlg)
+            return
+
+        def add(texts: list[str]) -> None:
+            current = self.also.get("1.0", "end").strip()
+            self.also.delete("1.0", "end")
+            self.also.insert("1.0", "\n".join([current, *texts]).strip())
+        SuggestDialog(self.mgr, self.dlg, f"Suggestions for: {q}", items, b.Entry(question=q, bank=self.entry.bank), add)
+
+
+class SuggestDialog:
+    """Review suggested wordings for one question and tick the ones to add."""
+
+    def __init__(self, mgr: BankManager, parent: tk.Misc, title: str, items: list[sg.Suggestion],
+                 entry: b.Entry, on_add: Callable[[list[str]], None]) -> None:
+        self.mgr, self.entry, self.on_add = mgr, entry, on_add
+        self.items = items
+        s = mgr.scale
+        d = self.dlg = tk.Toplevel(parent)
+        d.title("Suggested wordings")
+        d.configure(bg=BG)
+        d.transient(parent)
+        d.geometry(f"{int(640 * s)}x{int(520 * s)}")
+        d.grab_set()
+        tk.Label(d, text=title, bg=BG, fg=FG, font=mgr.fb, anchor="w", wraplength=int(600 * s), justify="left").pack(
+            fill="x", padx=14, pady=(12, 0))
+        tk.Label(d, text="Tick the ones you'd expect to hear. Wordings are checked against your other questions "
+                         "when the model is available.", bg=BG, fg=MUTED, font=mgr.fs, anchor="w", wraplength=int(600 * s),
+                 justify="left").pack(fill="x", padx=14, pady=(0, 6))
+        self.status = tk.Label(d, text="Checking against your other questions…", bg=BG, fg=MUTED, font=mgr.fs, anchor="w")
+        self.status.pack(fill="x", padx=14)
+        self.list = tk.Frame(d, bg=BG)
+        self.list.pack(fill="both", expand=True, padx=14, pady=6)
+        row = tk.Frame(d, bg=BG)
+        row.pack(fill="x", padx=14, pady=(0, 12))
+        mgr._btn(row, "Add ticked", self.add, True).pack(side="right")
+        mgr._btn(row, "Cancel", d.destroy).pack(side="right", padx=6)
+        d.bind("<Escape>", lambda e: d.destroy())
+        self.vars: list[tuple[tk.BooleanVar, sg.Suggestion]] = []
+        self._render(checked_first=5)
+        mgr.vet_async(items, entry, self._vetted)
+
+    def _render(self, checked_first: int = 5) -> None:
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.vars = []
+        for i, sug in enumerate(self.items):
+            var = tk.BooleanVar(value=i < checked_first and sug.ok)
+            note = ""
+            if sug.rival:
+                note = f"   ⚠ may be heard as “{sug.rival}”"
+            elif sug.sim is not None:
+                note = f"   {sug.sim:.0%} match"
+            tk.Checkbutton(self.list, text=sug.text + note, variable=var, bg=BG, fg=WARN if sug.rival else FG,
+                           selectcolor=PANEL, activebackground=BG, activeforeground=FG, font=self.mgr.f, anchor="w",
+                           justify="left", wraplength=int(580 * self.mgr.scale)).pack(fill="x", anchor="w")
+            self.vars.append((var, sug))
+
+    def _vetted(self, vetted) -> None:
+        if not self.dlg.winfo_exists():
+            return
+        if vetted is None:
+            self.status.configure(text="Couldn't check against your other questions (model not available). "
+                                       "Review these yourself.")
+            return
+        self.items = vetted
+        self.status.configure(text="Checked against your other questions." + (
+            " Anything marked ⚠ could put the wrong answer up, so it is left unticked." if any(v.rival for v in vetted) else ""))
+        self._render()
+
+    def add(self) -> None:
+        texts = [sug.text for var, sug in self.vars if var.get()]
+        self.dlg.destroy()
+        if texts:
+            self.on_add(texts)
+
+
+class BulkSuggestDialog:
+    """Suggested wordings for every question in a bank at once; click a ✓ to turn one on or off."""
+
+    def __init__(self, mgr: BankManager, bank: b.Bank) -> None:
+        self.mgr, self.bank = mgr, bank
+        s = mgr.scale
+        d = self.dlg = tk.Toplevel(mgr.win)
+        d.title(f"Suggest phrasings: {bank.title or bank.name}")
+        d.configure(bg=BG)
+        d.transient(mgr.win)
+        d.geometry(f"{int(860 * s)}x{int(620 * s)}")
+        d.grab_set()
+        tk.Label(d, text="Extra ways each question might be asked", bg=BG, fg=FG, font=mgr.fh, anchor="w").pack(
+            fill="x", padx=14, pady=(12, 0))
+        tk.Label(d, text="Click the ✓ column to turn a wording on or off, or click a question to switch all of its "
+                         "wordings. Nothing is saved until you press Add.", bg=BG, fg=MUTED, font=mgr.fs, anchor="w").pack(
+            fill="x", padx=14)
+        self.status = tk.Label(d, text="", bg=BG, fg=MUTED, font=mgr.fs, anchor="w")
+        self.status.pack(fill="x", padx=14, pady=(2, 0))
+        row = tk.Frame(d, bg=BG)
+        row.pack(side="bottom", fill="x", padx=14, pady=12)
+        self.add_btn = mgr._btn(row, "Add ticked", self.add, True)
+        self.add_btn.pack(side="right")
+        mgr._btn(row, "Cancel", d.destroy).pack(side="right", padx=6)
+        self.count = tk.Label(row, text="", bg=BG, fg=MUTED, font=mgr.fs)
+        self.count.pack(side="left")
+        frame = tk.Frame(d, bg=BG)
+        frame.pack(fill="both", expand=True, padx=14, pady=6)
+        self.tree = ttk.Treeview(frame, columns=("on", "text"), show="headings", selectmode="none")
+        self.tree.heading("on", text="✓")
+        self.tree.heading("text", text="Question / suggested wording")
+        self.tree.column("on", width=int(40 * s), anchor="center", stretch=False)
+        self.tree.column("text", width=int(760 * s), stretch=True)
+        self.tree.tag_configure("q", foreground=ACCENT)
+        self.tree.tag_configure("warn", foreground=WARN)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Button-1>", self._click)
+        d.bind("<Escape>", lambda e: d.destroy())
+        self.rows: dict[str, tuple[int, sg.Suggestion, bool]] = {}   # iid -> (entry index, suggestion, ticked)
+        self.heads: dict[str, int] = {}
+        self.touched: dict[tuple[int, str], bool] = {}               # ticks the user set by hand survive re-checking
+        self._fill([(i, sg.generate(e.question, e.phrasings(), limit=6)) for i, e in enumerate(bank.entries)])
+        self._vet_all()
+
+    def _fill(self, per_entry) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self.rows, self.heads = {}, {}
+        for i, items in per_entry:
+            if not items:
+                continue
+            h = f"q{i}"
+            self.tree.insert("", "end", iid=h, values=("", self.bank.entries[i].question), tags=("q",))
+            self.heads[h] = i
+            for k, sug in enumerate(items):
+                iid = f"s{i}_{k}"
+                on = self.touched.get((i, sug.text), k < 3 and sug.ok)
+                text = sug.text + (f"    ⚠ may be heard as “{sug.rival}”" if sug.rival else
+                                   f"    {sug.sim:.0%} match" if sug.sim is not None else "")
+                self.tree.insert("", "end", iid=iid, values=("✓" if on else "", "      " + text),
+                                 tags=("warn",) if sug.rival else ())
+                self.rows[iid] = (i, sug, on)
+        self._recount()
+
+    def _vet_all(self) -> None:
+        self.status.configure(text="Checking against your other questions… (the first time loads the model)")
+
+        def work():
+            try:
+                m = self.mgr._matcher()
+                out = []
+                for i, e in enumerate(self.bank.entries):
+                    items = sg.generate(e.question, e.phrasings(), limit=6)
+                    out.append((i, sg.vet(items, e, m)))
+                self.mgr.call_ui(lambda: self._vetted(out))
+            except Exception:  # noqa: BLE001
+                self.mgr.call_ui(lambda: self.status.configure(
+                    text="Couldn't check against your other questions (model not available). Review these yourself."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _vetted(self, out) -> None:
+        if not self.dlg.winfo_exists():
+            return
+        self.status.configure(text="Checked. Wordings marked ⚠ could put the wrong answer up, so they start unticked.")
+        self._fill(out)
+
+    def _click(self, event) -> str:
+        iid = self.tree.identify_row(event.y)
+        if iid in self.rows and self.tree.identify_column(event.x) == "#1":
+            i, sug, on = self.rows[iid]
+            self._set(iid, not on, by_user=True)
+        elif iid in self.heads:
+            kids = [k for k, (i, _, _) in self.rows.items() if i == self.heads[iid]]
+            turn_on = not all(self.rows[k][2] for k in kids)
+            for k in kids:
+                self._set(k, turn_on, by_user=True)
+        self._recount()
+        return "break"
+
+    def _set(self, iid: str, on: bool, by_user: bool = False) -> None:
+        i, sug, _ = self.rows[iid]
+        self.rows[iid] = (i, sug, on)
+        if by_user:
+            self.touched[(i, sug.text)] = on
+        self.tree.set(iid, "on", "✓" if on else "")
+
+    def _recount(self) -> None:
+        n = sum(1 for _, _, on in self.rows.values() if on)
+        self.count.configure(text=f"{n} wording{'s' if n != 1 else ''} ticked")
+        self.add_btn.configure(state="normal" if n else "disabled")
+
+    def add(self) -> None:
+        fresh = b.load_bank(self.bank.name)
+        added = 0
+        for i, sug, on in self.rows.values():
+            if on and i < len(fresh.entries):
+                e = fresh.entries[i]
+                if e.question == self.bank.entries[i].question and sug.text.lower() not in {p.lower() for p in e.phrasings()}:
+                    e.also.append(sug.text)
+                    added += 1
+        if added:
+            fresh.save()
+            self.mgr.refresh_banks(select=fresh.name)
+            self.mgr._changed()
+        self.dlg.destroy()
+        messagebox.showinfo("Suggest phrasings", f"Added {added} wording{'s' if added != 1 else ''}.", parent=self.mgr.win)
 
 
 if __name__ == "__main__":
