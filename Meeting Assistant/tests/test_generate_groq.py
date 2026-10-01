@@ -401,3 +401,46 @@ def test_the_finished_draft_is_tidied_but_streaming_is_untouched():
     ev = run(g.Generator({"generate": True}, lambda *a: None, http=h))
     assert ev[-1][1]["text"] == "Own it. Done."
     assert "".join(d for k, d in ev if k == "delta").startswith("Here's an answer:")      # the screen swaps in the clean text at the end
+
+
+# ---------- length and repeated stories over the real HTTP code ----------
+
+def story_script(text, size=4, delay=0.0):
+    words = text.split(" ")
+    pieces = [" ".join(words[i:i + size]) + " " for i in range(0, len(words), size)]
+    return {"events": sse(*[chunk(p) for p in pieces], chunk(finish="stop")), "delay": delay}
+
+
+def asked(question, utt):
+    return g.build_request(question, [], thr=THR, utt=utt)
+
+
+def test_a_long_answer_over_the_wire_is_cut_and_the_connection_closed(groq):
+    long_text = " ".join(["That is how it went."] * 80)
+    groq.script = [story_script(long_text, delay=0.01)]
+    gen = gen_for(groq)
+    ev = run(gen, asked("Tell me about a time you led a team", 1))
+    done = ev[-1][1]
+    assert ev[-1][0] == "done" and done["trimmed"] and done["words"] <= gen.max_words and done["text"].endswith(".")
+    assert groq.broken.wait(3)                                                    # we hung up instead of reading all 400 words
+    assert groq.requests[0][3]["max_tokens"] <= g.GROQ_MAX_TOKENS
+
+
+def test_a_repeated_story_over_the_wire_is_replaced_by_a_different_one(groq):
+    from story_samples import HACKATHON, LED_MIGRATION, MIGRATION_SHORT
+    groq.script = [story_script(LED_MIGRATION), story_script(MIGRATION_SHORT, delay=0.01), story_script(HACKATHON)]
+    gen = gen_for(groq)
+    first = run(gen, asked("Tell me about a time you led a team", 1))[-1][1]
+    assert first["text"].startswith("A while back at my last company") and not first["reworded"]
+    ev = run(gen, asked("Tell me about a time you handled conflict", 2))
+    kinds = [k for k, _ in ev]
+    assert "retry" in kinds and kinds[-1] == "done"
+    done = ev[-1][1]
+    assert done["text"] == HACKATHON and done["reworded"] and not done["similar"]
+    assert groq.broken.wait(3)                                                    # the repeated opening was not read to the end
+    posts = [r[3] for r in groq.requests if r[0] == "POST"]
+    assert len(posts) == 3
+    users = [p["messages"][1]["content"] for p in posts]
+    assert "<already_told>" not in users[0] and "<already_told>" in users[1] and "<already_told>" in users[2]
+    assert "Your first attempt told the same story" in users[2] and "Your first attempt" not in users[1]
+    assert users[1].rstrip().endswith("Write the answer the user should say now.")

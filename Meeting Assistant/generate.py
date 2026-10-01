@@ -5,10 +5,17 @@ facts about you) go to a language model, which writes what to SAY next:
 
 * a question that lines up with a prepared answer gets that answer, lightly adapted;
 * one that only partly lines up gets the relevant parts combined, with the gap bridged;
-* one nothing covers gets a short, sensible answer, with a {{placeholder}} wherever a personal
-  fact (a name, number, date, employer) would be needed, so nothing is ever invented for you.
+* one nothing covers gets a short, sensible answer, with believable details filled in where a
+  personal fact would be needed.
 
 The prepared answer is still shown instantly; the draft streams in beside it.
+
+Length: a draft is written to take about 45-50 seconds to say (config "generate_seconds", default 48,
+at roughly 2.3 words a second) and is cut at a sentence if the model runs over.
+
+Stories: the stories already used in drafts this session are remembered (in memory only, so closing the
+program forgets them).  The model is told not to retell them, and a finished draft that still repeats one
+is rewritten once with a different story.  Follow-up questions are exempt: they are meant to continue it.
 
 Two providers (config "generate_provider": "auto", "groq" or "anthropic"):
 
@@ -32,11 +39,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Sequence
 
 from bank import ROOT, Entry
 from matcher import Match
+from stories import StoryLog
 
 DEFAULT_MODEL = "claude-opus-5-5"                  # Anthropic
 GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
@@ -52,16 +60,26 @@ MAX_ANSWER_CHARS = 2500      # per prepared answer sent
 MAX_PROFILE_CHARS = 6000
 RELATED_FLOOR = 0.25         # a prepared answer this far below the match threshold is no longer "related"
 
+WORDS_PER_SECOND = 2.3       # a relaxed speaking (or reading-aloud) pace: about 138 words a minute
+DEFAULT_SECONDS = 46         # aimed a little under 50 seconds: the cap below then lands at about 51
+MIN_SECONDS, MAX_SECONDS = 15, 120
+OVER_FACTOR = 1.1            # the model is told never to exceed target x 1.1 words; anything longer is cut
+GATE_WORDS = 30              # with earlier stories on record, hold back this many words to check the opening
+GROQ_MAX_TOKENS = 1600       # plenty for an answer this short, and a ceiling on a runaway reply
+REWORD_NOTE = "Rewording it so it doesn't repeat a story you've already told…"
+
 SYSTEM = """You write what the user should SAY next in a live meeting or interview, right after the other person asked them something. The user may be deaf or hard of hearing and will read your text aloud or sign from it, so it has to sound like a real person talking.
 
 Voice: warm, confident and professional, the way a thoughtful colleague speaks in an interview, never the way someone reads a script. Use first person and natural contractions ("I'd", "we've", "that's"), sentences of varied length that flow into each other, and ordinary connecting phrases ("So", "What I found was", "Looking back"). Avoid stiff or corporate wording, filler such as "Great question", and anything that sounds like a list read aloud.
 
-Shape: one to three short paragraphs of plain prose, about {words} words (a quick factual question can be shorter; a story can run to about {long_words} words). Never use bullet points, numbered lists, headings, bold or any other markdown, and no quotation marks around the answer.
-When the question asks about an experience (a time you..., an example, how you handled something, what happened), tell it as one flowing story in STARR order: the Situation, the Task, the Action you took, the Result, and a brief Reflection on what you learned. Weave the five parts together naturally and never label them. For other questions (opinions, motivation, technical or "why" questions) answer directly and conversationally, with the reasoning behind it.
+Length: this will be spoken aloud and must take about {seconds} seconds, so write about {words} words and never more than {max_words}. Be selective: keep the points that matter most and leave out the rest, and when a prepared answer is longer than that, condense it rather than covering everything. A quick factual question can be shorter.
+Shape: one or two short paragraphs of plain prose (three at most). Never use bullet points, numbered lists, headings, bold or any other markdown, and no quotation marks around the answer.
+When the question asks about an experience (a time you..., an example, how you handled something, what happened), tell it as one flowing story in STARR order: the Situation, the Task, the Action you took, the Result, and a brief Reflection on what you learned. Keep it compact: a sentence or two for the Situation and Task together, most of the words on the Action, and about a sentence each for the Result and the Reflection, so the Result is never cut off. Weave the five parts together naturally and never label them. For other questions (opinions, motivation, technical or "why" questions) answer directly and conversationally, with the reasoning behind it.
+Stories: when <already_told> lists stories used earlier in this conversation, never retell one of them. Use a clearly different experience (a different situation, setting, people, numbers and outcome). If the only story you have is one that was already used, keep the skill or lesson it shows but change the circumstances (the kind of project or problem, the setting, who was involved, the numbers and the timeline) and the way it opens, so nobody would recognise it as the same story. Never say that you changed anything.
 
 Your sources, in order of authority:
 1. PREPARED ANSWERS - the user's own scripted answers to similar questions, each marked with how closely its question matches what was asked. They hold the user's voice and facts, though they may be written as notes or bullets: turn them into natural speech and keep their facts.
-   - If one matches closely, adapt it with the lightest edit that makes it fit the question asked.
+   - If one matches closely, adapt it with the lightest edit that makes it fit the question asked (unless its story was already used: see Stories).
    - If they only partly match, combine the relevant parts and bridge the gap yourself.
    - If none matches, answer from general reasoning and structure.
 2. PROFILE - facts about the user, when provided.
@@ -80,6 +98,18 @@ CUE_TEXT = {
 }
 
 
+ASK = "Write the answer the user should say now."
+TOLD_HEAD = ("<already_told>\nThe other person has already heard these stories from the user in this conversation:\n")
+TOLD_TAIL = ("\n</already_told>\nDo not retell any of them. If this answer tells a story, tell a clearly different one: "
+             "a different situation, setting, people, numbers and outcome. If the only story available is one of these, "
+             "keep the skill or lesson it shows but change the circumstances and the way it opens until nobody would "
+             "recognise it as the same story.")
+RETELL = ("Your first attempt told the same story as this earlier answer, which the other person has already heard:\n"
+          "\"{digest}\"\nWrite the answer again so that it is clearly a different story: change the kind of project or "
+          "problem, the setting, who was involved, the numbers and the timeline, and open it differently. Keep the same "
+          "skill or lesson, stay conversational, and keep to the length limit. Do not mention that you changed anything.")
+
+
 @dataclass
 class Request:
     system: list
@@ -87,6 +117,58 @@ class Request:
     summary: str                  # one line for the screen, e.g. "adapted from your prepared answer"
     question: str
     sources: list = field(default_factory=list)   # the Entry objects that were sent
+    utt: object = None            # which utterance this answers (a newer draft for it replaces the older one)
+    repeat_ok: bool = False       # a follow-up: carrying on with the earlier story is the point
+
+    def _with_note(self, note: str) -> "Request":
+        last = self.messages[-1]
+        head, sep, tail = last["content"].rpartition(ASK)
+        content = f"{head}{note}\n\n{ASK}{tail}" if sep else f"{last['content']}\n\n{note}"
+        return replace(self, messages=[*self.messages[:-1], {**last, "content": content}])
+
+    def with_told(self, stories) -> "Request":
+        """The same request plus the stories already used in this run of the program."""
+        if not stories:
+            return self
+        lines = [f'{i}. Asked "{s.question}": {s.digest}' for i, s in enumerate(stories, 1)]
+        return self._with_note(TOLD_HEAD + "\n".join(lines) + TOLD_TAIL)
+
+    def retold(self, story) -> "Request":
+        """The same request, asking for a different story than the one a first attempt repeated."""
+        return self._with_note(RETELL.format(digest=story.digest))
+
+
+def words_for(seconds: float) -> int:
+    return round(seconds * WORDS_PER_SECOND)
+
+
+def limit_for(words: int) -> int:
+    return round(words * OVER_FACTOR)
+
+
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def spoken_seconds(text: str) -> float:
+    return count_words(text) / WORDS_PER_SECOND
+
+
+_SENTENCE_END = re.compile(r"[.!?][\"”')\]]*(?=\s|$)")
+
+
+def fit_words(text: str, limit: int) -> tuple[str, bool]:
+    """Keep at most `limit` words, ending on a sentence when one falls close enough. Returns (text, was it cut)."""
+    ends = [m.end() for m in re.finditer(r"\S+", text)]
+    if limit <= 0 or len(ends) <= limit:
+        return text, False
+    head = text[:ends[limit - 1]]
+    last = None
+    for m in _SENTENCE_END.finditer(head):
+        last = m
+    if last is not None and count_words(head[:last.end()]) >= limit * 0.6:
+        return head[:last.end()].rstrip(), True
+    return head.rstrip(" ,;:-–—") + ".", True
 
 
 def load_profile(path=None) -> str:
@@ -118,11 +200,13 @@ def _entry_block(i: int, e: Entry, score: float, thr: float) -> str:
     return "\n".join(lines)
 
 
-def build_request(heard: str, matches: Sequence[Match], *, thr: float, words: int = 130, max_matches: int = 3,
-                  profile: str = "", parent: Entry | None = None, cue=None,
-                  recent: Sequence[Entry] = ()) -> Request:
+def build_request(heard: str, matches: Sequence[Match], *, thr: float, words: int = words_for(DEFAULT_SECONDS),
+                  max_matches: int = 3, profile: str = "", parent: Entry | None = None, cue=None,
+                  recent: Sequence[Entry] = (), utt=None) -> Request:
     """Everything the model needs, as a stable system prompt (cacheable) plus one user message."""
-    system = [{"type": "text", "text": SYSTEM.replace("{words}", str(words)).replace("{long_words}", str(round(words * 1.4)))}]
+    text = (SYSTEM.replace("{seconds}", str(round(words / WORDS_PER_SECOND))).replace("{words}", str(words))
+            .replace("{max_words}", str(limit_for(words))))
+    system = [{"type": "text", "text": text}]
     if profile:
         system.append({"type": "text", "text": "PROFILE (facts about the user):\n" + profile,
                        "cache_control": {"type": "ephemeral"}})
@@ -143,7 +227,7 @@ def build_request(heard: str, matches: Sequence[Match], *, thr: float, words: in
         parts.append(f"<prepared_answers>\n{blocks}\n</prepared_answers>")
     else:
         parts.append("<prepared_answers>\nNone of the prepared answers matches this question.\n</prepared_answers>")
-    parts.append("Write the answer the user should say now.")
+    parts.append(ASK)
 
     best = used[0].score if used else 0.0
     if used and best >= thr:
@@ -155,7 +239,7 @@ def build_request(heard: str, matches: Sequence[Match], *, thr: float, words: in
     if profile:
         summary += " + profile"
     return Request(system, [{"role": "user", "content": "\n\n".join(parts)}], summary, heard.strip(),
-                   [m.entry for m in used])
+                   [m.entry for m in used], utt=utt, repeat_ok=parent is not None)
 
 
 def _read_key_file(path) -> str:
@@ -321,31 +405,64 @@ class _ThinkFilter:
 
 
 class _Run:
-    """The text of one drafting job as it arrives."""
+    """The text of one drafting attempt as it arrives.
 
-    def __init__(self, gen: "Generator", job: int) -> None:
-        self.gen, self.job, self.parts, self.first, self.t0 = gen, job, [], None, time.monotonic()
+    With earlier stories on record (`gate`), the first GATE_WORDS words are held back and checked against them,
+    so a repeated opening is replaced before it is ever shown.  Past `limit` words the stream is cut."""
+
+    def __init__(self, gen: "Generator", job: int, limit: int = 0, gate=None, t0: float | None = None) -> None:
+        self.gen, self.job, self.limit, self.gate = gen, job, limit, gate
+        self.t0 = time.monotonic() if t0 is None else t0
+        self.text, self.sent, self.first = "", 0, None
+        self.held = gate is not None
+        self.hit = None               # the earlier story the opening repeated
+        self.capped = False
 
     def push(self, piece: str) -> bool:
-        """Deliver a piece; False means a newer question replaced this job, so stop."""
-        if not self.parts:
+        """Take a piece; False means stop reading: a newer question replaced this job, the opening repeated an
+        earlier story (self.hit), or the draft reached its length limit (self.capped)."""
+        if not self.text:
             piece = piece.lstrip()
             if not piece:
                 return self.gen._current(self.job)
         if not self.gen._current(self.job):
             return False
-        if self.first is None:
-            self.first = time.monotonic() - self.t0
-        self.parts.append(piece)
-        self.gen._emit(self.job, "delta", piece)
+        self.text += piece
+        words = count_words(self.text)
+        if self.held:
+            if words < GATE_WORDS:
+                return True
+            self.held = False
+            self.hit = self.gate(self.text)
+            if self.hit is not None:
+                return False
+        self._release()
+        if self.limit and words > self.limit:
+            self.capped = True
+            return False
         return True
+
+    def _release(self) -> None:
+        new = self.text[self.sent:]
+        if new:
+            if self.first is None:
+                self.first = time.monotonic() - self.t0
+            self.sent = len(self.text)
+            self.gen._emit(self.job, "delta", new)
+
+    def finish(self) -> None:
+        """The stream ended: show whatever is still held back, unless it was held back because it repeats a story."""
+        self.held = False
+        if self.hit is None:
+            self._release()
 
 
 class Generator:
     """Runs one drafting job at a time on a background thread; a newer job silently replaces an older one.
 
     on_event(job, kind, data) is called from the worker thread with kind in:
-      "start" (data: one-line summary), "delta" (data: new text), "done" (data: dict), "error" (data: message).
+      "start" (data: one-line summary), "delta" (data: new text), "done" (data: dict), "error" (data: message),
+      "retry" (data: a note) - the draft repeated an earlier story, so what was shown is void and a new one follows.
 
     `client_factory` (an Anthropic-style client) and `http` (a function taking the Groq request payload and
     returning the response's server-sent-event data lines) exist so tests can run without a network."""
@@ -363,6 +480,7 @@ class Generator:
         self._groq_model_pick = ""
         self.disabled_reason = ""          # set after a failure that will repeat (bad or missing key)
         self.profile = load_profile()
+        self.stories = StoryLog()          # what has been told so far; lives in memory only
 
     # ----- which provider, which model -----
     @property
@@ -386,8 +504,25 @@ class Generator:
         return want or DEFAULT_MODEL
 
     @property
+    def seconds(self) -> float:
+        """How long a draft should take to say (config "generate_seconds")."""
+        try:
+            want = float(self.cfg.get("generate_seconds", DEFAULT_SECONDS))
+        except (TypeError, ValueError):
+            want = DEFAULT_SECONDS
+        return min(MAX_SECONDS, max(MIN_SECONDS, want))
+
+    @property
     def words(self) -> int:
-        return int(self.cfg.get("generate_words", 150))
+        return words_for(self.seconds)
+
+    @property
+    def max_words(self) -> int:
+        return limit_for(self.words)
+
+    @property
+    def avoid_repeats(self) -> bool:
+        return bool(self.cfg.get("generate_avoid_repeats", True))
 
     def status(self) -> tuple[bool, str]:
         """(usable, why not). Switched on in config, a key present, and no repeating failure so far."""
@@ -473,26 +608,70 @@ class Generator:
             self._emit(job, "error", why)
             return
         self._emit(job, "start", request.summary)
-        run = _Run(self, job)
         try:
-            meta = self._stream_groq(run, request) if self.provider == "groq" else self._stream_anthropic(run, request)
+            result = self._draft(job, request)
         except Exception as e:  # noqa: BLE001 - every failure becomes a message on screen, never a crash
             message, repeats = explain_error(e)
             if repeats:
                 self.disabled_reason = message
             self._emit(job, "error", message)
             return
-        if meta is None:                        # superseded while streaming
+        if result is None:                      # superseded while streaming
             return
-        if meta.get("stop") == "refusal":
+        if result == "refusal":
             self._emit(job, "error", "The model declined to answer that one.")
             return
-        usage = meta.get("usage", {})
-        self._emit(job, "done", {
-            "text": tidy_draft("".join(run.parts)), "seconds": time.monotonic() - run.t0, "first": run.first or 0.0,
-            "truncated": meta.get("stop") in ("max_tokens", "length"), "model": self.model,
-            "provider": self.provider, "input_tokens": usage.get("input", 0), "output_tokens": usage.get("output", 0),
-            "cached_tokens": usage.get("cached", 0)})
+        if self.avoid_repeats and self._current(job):
+            self.stories.add(request.utt, request.question, result["text"])
+        self._emit(job, "done", result)
+
+    def _draft(self, job: int, request: Request):
+        """One answer: streamed, held to its length, and (unless it is a follow-up) kept clear of earlier stories.
+        Returns the "done" payload, "refusal", or None when a newer job took over."""
+        key, question, limit = request.utt, request.question, self.max_words
+        check = self.avoid_repeats and not request.repeat_ok
+        attempt = request.with_told(self.stories.recall(key, question)) if check else request
+        t0 = time.monotonic()
+        usage = {"input": 0, "output": 0, "cached": 0}
+        reworded, first_text = False, ""
+        for tries in (1, 2):
+            gate = (lambda t: self.stories.opening(t, key, question)) if check and tries == 1 and len(self.stories) else None
+            run = _Run(self, job, limit, gate, t0)
+            try:
+                meta = self._stream(run, attempt)
+            except Exception:  # noqa: BLE001
+                if tries == 2 and first_text:   # the rewrite failed: the first draft is still better than nothing
+                    return self._finish(run, first_text, usage, reworded=False, similar=True, trimmed=False, meta={})
+                raise
+            gated = meta is None and run.hit is not None        # stopped at the opening: only a fragment exists
+            if meta is None:
+                if run.hit is None and not run.capped:
+                    return None
+                meta = {"stop": "words" if run.capped else None, "usage": {}}
+            run.finish()
+            for k, v in (meta.get("usage") or {}).items():
+                usage[k] = usage.get(k, 0) + (v or 0)
+            if meta.get("stop") == "refusal":
+                return self._finish(run, first_text, usage, False, True, False, meta) if tries == 2 and first_text else "refusal"
+            text, trimmed = fit_words(tidy_draft(run.text), limit)
+            hit = run.hit or (self.stories.find(text, key, question) if check else None)
+            if hit is not None and tries == 1:
+                reworded, first_text = True, "" if gated else text
+                self._emit(job, "retry", REWORD_NOTE)
+                attempt = attempt.retold(hit)
+                continue
+            return self._finish(run, text, usage, reworded=reworded, similar=hit is not None, trimmed=trimmed, meta=meta)
+
+    def _finish(self, run: _Run, text: str, usage: dict, reworded: bool, similar: bool, trimmed: bool, meta: dict) -> dict:
+        return {
+            "text": text, "seconds": time.monotonic() - run.t0, "first": run.first or 0.0,
+            "truncated": meta.get("stop") in ("max_tokens", "length"), "trimmed": trimmed,
+            "words": count_words(text), "spoken": spoken_seconds(text),
+            "reworded": reworded, "similar": similar, "model": self.model, "provider": self.provider,
+            "input_tokens": usage["input"], "output_tokens": usage["output"], "cached_tokens": usage["cached"]}
+
+    def _stream(self, run: _Run, request: Request):
+        return self._stream_groq(run, request) if self.provider == "groq" else self._stream_anthropic(run, request)
 
     # ----- Anthropic -----
     def _stream_anthropic(self, run: _Run, request: Request):
@@ -526,7 +705,7 @@ class Generator:
     def _groq_payload(self, request: Request) -> dict:
         system = "\n\n".join(blk["text"] for blk in request.system)
         return {"model": self.model, "stream": True, "temperature": 0.6,
-                "max_tokens": int(self.cfg.get("generate_max_tokens", 4000)),
+                "max_tokens": min(int(self.cfg.get("generate_max_tokens", 4000)), GROQ_MAX_TOKENS),
                 "stream_options": {"include_usage": True},
                 "messages": [{"role": "system", "content": system}, *request.messages]}
 

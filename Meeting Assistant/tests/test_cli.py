@@ -190,6 +190,20 @@ def test_generate_prints_the_streamed_draft_and_timing(gen_cli, capsys, monkeypa
     assert "led a team" in sent and "LEAD" in sent
 
 
+def test_generate_reports_how_long_the_answer_takes_to_say(gen_cli, capsys, monkeypatch):
+    _fake_generator(monkeypatch, pieces=("I led a team of six. ", "We shipped on time. ", "It went well."))
+    app.main(["generate", "Tell me about a time you led a team?"])
+    out = capsys.readouterr().out
+    assert "[about 6s to say (13 words);" in out and "trimmed" not in out and "reworded" not in out
+
+
+def test_generate_says_when_a_long_draft_was_trimmed(gen_cli, capsys, monkeypatch):
+    _fake_generator(monkeypatch, pieces=tuple("That is how it went. " for _ in range(80)))
+    app.main(["generate", "Tell me about a time you led a team?"])
+    out = capsys.readouterr().out
+    assert "trimmed to length" in out and "tokens in" not in out                  # the stream was stopped early: no usage figures
+
+
 def test_generate_show_prompt_discloses_what_is_sent(gen_cli, capsys, monkeypatch):
     _fake_generator(monkeypatch)
     app.main(["generate", "What is your biggest weakness?", "--show-prompt"])

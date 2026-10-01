@@ -16,7 +16,9 @@ import bank as b  # noqa: E402
 import generate as g  # noqa: E402
 from conftest import fake_embed  # noqa: E402
 from matcher import Matcher  # noqa: E402
+from story_samples import HACKATHON, LED_MIGRATION, MIGRATION_REWORDED, MIGRATION_SHORT  # noqa: E402
 from test_generate import FakeClient, _api_error  # noqa: E402
+from test_generate_stories import SeqClient, words  # noqa: E402
 from test_overlay_ui import FakeListener, body, pump, ready, say  # noqa: E402
 
 DRAFT = ["I lead by listening first. ", "On my last team, which was about six people, ", "I kept everyone aligned."]
@@ -330,7 +332,7 @@ def test_half_streamed_markers_never_flash_on_screen(ov, holder):
 
 
 def test_a_long_draft_does_not_freeze_the_window(ov, holder):
-    holder.client = FakeClient(pieces=[f"word{i} " for i in range(400)], delay=0.002)
+    holder.client = FakeClient(pieces=[f"word{i} " for i in range(400)], delay=0.006)
     ready(ov)
     say(ov, "Tell me about a time you led a team?", utt=1)
     t0, ticks = time.monotonic(), 0
@@ -338,4 +340,130 @@ def test_a_long_draft_does_not_freeze_the_window(ov, holder):
         ov.root.update()
         ticks += 1
         time.sleep(0.005)
-    assert drafted(ov) and gbody(ov).count("word") == 400 and ticks > 20
+    assert drafted(ov) and gbody(ov).count("word") == ov.gen.max_words and ticks > 20       # streamed, then cut to length
+
+
+# ---------- length and repeated stories ----------
+
+def test_the_status_says_about_how_long_the_draft_takes_to_say(ov, holder):
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    n = len(DRAFT_TEXT.split())
+    assert f"about {n / g.WORDS_PER_SECOND:.0f}s to say" in ov.gen_status.cget("text")
+    assert "trimmed" not in ov.gen_status.cget("text")
+
+
+def test_a_draft_that_runs_long_is_cut_to_about_fifty_seconds(ov, holder):
+    holder.client = SeqClient(words(400))
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    n = len(gbody(ov).split())
+    assert n <= ov.gen.max_words == 117 and 45 <= n / g.WORDS_PER_SECOND <= 51
+    assert gbody(ov).endswith(".") and "trimmed to length" in ov.gen_status.cget("text")
+    assert ov.gen_status.cget("text").count("about 50s to say") == 1
+
+
+def test_the_request_carries_the_utterance_so_a_new_draft_replaces_the_old(ov, holder):
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=5)
+    assert pump(ov, lambda: drafted(ov))
+    assert ov._last_req.utt == 5 and ov._last_req.repeat_ok is False
+    say(ov, "Can you elaborate on that for me?", utt=6)
+    assert pump(ov, lambda: ov._gen_job == 2 and drafted(ov))
+    assert ov._last_req.utt == 6 and ov._last_req.repeat_ok is True                        # a follow-up may carry on the story
+
+
+def test_a_story_that_repeats_is_replaced_and_the_screen_says_so(ov, holder):
+    holder.client = SeqClient(LED_MIGRATION, MIGRATION_SHORT, HACKATHON)
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov)) and gbody(ov).startswith("A while back at my last company")
+    assert "reworded" not in ov.gen_status.cget("text")
+    say(ov, "What is your biggest weakness?", utt=2)
+    assert pump(ov, lambda: drafted(ov) and ov._gen_job == 2)
+    assert gbody(ov) == HACKATHON                                                           # the repeat never stayed on screen
+    assert "migrate" not in gbody(ov) and ov.gen_reworded and not ov.gen_similar
+    assert "reworded: the first try repeated an earlier story" in ov.gen_status.cget("text")
+    assert "WEAK answer" in body(ov)                                                        # the prepared column was never touched
+    assert len(holder.client.calls) == 3
+    assert "<already_told>" in holder.client.prompt(1) and "A while back at my last company" in holder.client.prompt(1)
+
+
+def test_a_draft_that_streams_before_it_is_caught_is_cleared_with_a_note(ov):
+    ready(ov)
+    ov._on_gen(1, "start", "adapted from your prepared answer")
+    ov._on_gen(1, "delta", "At my previous job we were replacing the old invoicing tool. ")
+    assert "invoicing tool" in gbody(ov) or ov._render_pending
+    ov._on_gen(1, "retry", g.REWORD_NOTE)
+    assert ov.gen_text == "" and gbody(ov) == g.REWORD_NOTE and ov.gen_state == "drafting"
+    assert "rewording" in ov.gen_status.cget("text") and ov.save_btn.cget("state") == "disabled"
+    ov._on_gen(1, "delta", "In my second year I ran a hackathon.")
+    ov._on_gen(1, "done", {"text": "In my second year I ran a hackathon.", "seconds": 2.0, "model": "m", "reworded": True,
+                           "spoken": 3.0})
+    assert gbody(ov) == "In my second year I ran a hackathon." and ov.gen_state == "done"
+    assert "reworded: the first try repeated an earlier story" in ov.gen_status.cget("text")
+
+
+def test_a_draft_that_still_resembles_an_earlier_story_is_marked(ov):
+    ready(ov)
+    ov._on_gen(1, "done", {"text": MIGRATION_REWORDED, "seconds": 2.0, "model": "m", "reworded": True, "similar": True,
+                           "spoken": 37.0})
+    text = ov.gen_status.cget("text")
+    assert "may still resemble an earlier story" in text and "the first try repeated" not in text
+
+
+def test_a_follow_up_is_not_reworded_for_continuing_the_story(ov, holder):
+    holder.client = SeqClient(LED_MIGRATION, MIGRATION_SHORT)
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    say(ov, "Can you elaborate on that for me?", utt=2)
+    assert pump(ov, lambda: ov._gen_job == 2 and drafted(ov))
+    assert not ov.gen_reworded and len(holder.client.calls) == 2 and gbody(ov).startswith("At my last company")
+
+
+def test_regenerating_a_story_is_not_held_against_the_original(ov, holder):
+    holder.client = SeqClient(LED_MIGRATION, MIGRATION_SHORT)
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    ov.regen_btn.invoke()
+    assert pump(ov, lambda: ov.gen_state == "done" and ov.gen_text.startswith("At my last company"))
+    assert not ov.gen_reworded and len(holder.client.calls) == 2 and len(ov.gen.stories) == 1
+
+
+def test_closing_and_reopening_starts_with_no_stories_remembered(banks_dir, monkeypatch, holder):
+    """The story memory lives in the running program only."""
+    import overlay
+    gens = []
+
+    def make(cfg, on_event):
+        gens.append(g.Generator(cfg, on_event, client_factory=lambda: SimpleNamespace(
+            messages=SimpleNamespace(stream=lambda **kw: holder.client.stream(**kw)))))
+        return gens[-1]
+    banks_dir.mkdir(parents=True)
+    b.Bank("demo", "Demo", [b.Entry("Tell me about a time you led a team", "Lead answer", bank="demo")]).save()
+    b.CONFIG_PATH.write_text(json.dumps({"active_banks": ["demo"], "match_threshold": 0.78, "generate": True}), encoding="utf-8")
+    monkeypatch.setattr(overlay, "Listener", FakeListener)
+    monkeypatch.setattr(overlay, "Matcher", lambda: Matcher(embed_fn=fake_embed))
+    monkeypatch.setattr(overlay, "Generator", make)
+    holder.client = SeqClient(LED_MIGRATION)
+    first = overlay.Overlay()
+    try:
+        ready(first)
+        say(first, "Tell me about a time you led a team?", utt=1)
+        assert pump(first, lambda: drafted(first)) and len(first.gen.stories) == 1
+    finally:
+        first._quit()
+    second = overlay.Overlay()
+    try:
+        ready(second)
+        assert len(second.gen.stories) == 0
+        say(second, "Tell me about a time you led a team?", utt=1)
+        assert pump(second, lambda: drafted(second))
+        assert "<already_told>" not in holder.client.prompt(len(holder.client.calls) - 1)
+        assert not second.gen_reworded
+    finally:
+        second._quit()

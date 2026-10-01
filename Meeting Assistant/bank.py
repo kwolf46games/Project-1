@@ -52,7 +52,8 @@ DEFAULT_CONFIG = {
     "generate_provider": "auto",     # "auto" = Groq if you have a Groq key, else Anthropic; or "groq" / "anthropic"
     "generate_model": "",            # blank = the provider's default (run `it generate --models` to see Groq's)
     "generate_effort": "low",        # low = fastest; medium/high think longer
-    "generate_words": 150,           # about how long a drafted answer should be (stories run a bit longer)
+    "generate_seconds": 46,          # how long a drafted answer should take to say (about 45-50 s; 2.3 words a second)
+    "generate_avoid_repeats": True,  # don't tell the same story twice in one session (forgotten when the program closes)
     "generate_matches": 3,           # how many of your prepared answers are sent as the source material
     "generate_max_tokens": 4000,
 }

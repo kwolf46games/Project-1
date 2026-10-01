@@ -58,6 +58,8 @@ class Overlay:
         self.gen_seconds = 0.0
         self.gen_model = ""
         self.gen_truncated = False
+        self.gen_spoken = 0.0                 # about how many seconds the draft takes to say
+        self.gen_trimmed = self.gen_reworded = self.gen_similar = False
         self._gen_floor = 0                   # events from jobs up to this id are stale
         self._gen_job = 0
         self._gen_seen = 0
@@ -197,11 +199,11 @@ class Overlay:
         rbar.update_idletasks()
         mbar.configure(height=rbar.winfo_reqheight())      # same header height on both sides
         mbar.pack_propagate(False)
-        self.gen_status = tk.Label(self.right, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
-                                   justify="left", wraplength=300)
+        self.gen_status = tk.Label(self.right, text="", fg=MUTED, bg=BG, font=self.small, anchor="nw",
+                                   justify="left", wraplength=300, height=2)     # two lines reserved, so both columns end level
         self.gen_status.pack(side="bottom", fill="x", padx=4, pady=(4, 0))
-        self.prep_status = tk.Label(self.mid, text="", fg=MUTED, bg=BG, font=self.small, anchor="w",
-                                    justify="left", wraplength=300)
+        self.prep_status = tk.Label(self.mid, text="", fg=MUTED, bg=BG, font=self.small, anchor="nw",
+                                    justify="left", wraplength=300, height=2)
         self.prep_status.pack(side="bottom", fill="x", padx=4, pady=(4, 0))
         self.text = self._answer_box(self.mid)
         self.gtext = self._answer_box(self.right)
@@ -372,7 +374,7 @@ class Overlay:
         parent = d.parent if d.is_followup else None
         req = build_request(text, d.matches, thr=thr, words=gen.words, max_matches=int(self.cfg.get("generate_matches", 3)),
                             profile=gen.profile, parent=parent, cue=d.cue if parent else None,
-                            recent=self.conv.recent(2))
+                            recent=self.conv.recent(2), utt=h.utt)
         # a confident answer can't be a half-heard fragment; anything else waits a beat in case more is coming
         delay = 0.5 if d.action in ("ignore", "unsure") and not text.endswith("?") else 0.0
         job = gen.start(req, delay=delay)
@@ -500,14 +502,14 @@ class Overlay:
         """A different question's answer is up: forget the draft and ignore events from older jobs."""
         self._gen_floor = self._gen_seen
         self.gen_text, self.gen_state, self.gen_note, self.gen_summary = "", "idle", "", ""
-        self.gen_truncated = False
+        self.gen_truncated = self.gen_trimmed = self.gen_reworded = self.gen_similar = False
         self._refresh_gen_ui()
         self._render_gen()
 
     def _begin_gen(self, job: int) -> None:
         self._gen_job = self._gen_seen = max(self._gen_seen, job)
         self.gen_text, self.gen_state, self.gen_note = "", "drafting", ""
-        self.gen_truncated = False
+        self.gen_truncated = self.gen_trimmed = self.gen_reworded = self.gen_similar = False
 
     def _on_gen_req(self, job: int, req, has_prepared: bool) -> None:
         if job <= self._gen_floor:
@@ -542,11 +544,17 @@ class Overlay:
         elif kind == "delta":
             self.gen_text += str(data)
             self._schedule_render()
+        elif kind == "retry":       # it repeated a story already told: what is on screen is void, a new one follows
+            self.gen_text, self.gen_state, self.gen_note, self.gen_reworded = "", "drafting", str(data), True
+            self._render_gen()
         elif kind == "done":
             self.gen_text = (data.get("text") or self.gen_text).strip()
             self.gen_state, self.gen_seconds = "done", float(data.get("seconds", 0.0))
             self.gen_model = str(data.get("model", ""))
             self.gen_truncated = bool(data.get("truncated"))
+            self.gen_trimmed, self.gen_similar = bool(data.get("trimmed")), bool(data.get("similar"))
+            self.gen_reworded = bool(data.get("reworded"))
+            self.gen_spoken = float(data.get("spoken", 0.0))
             self._render_gen()
         elif kind == "error":
             self.gen_state, self.gen_note = "error", str(data)
@@ -575,7 +583,7 @@ class Overlay:
             paras = [p.strip() for p in plain_prose(text).split("\n") if p.strip()]
             self._fill(self.gtext, [(p, ()) for p in paras])
         elif self.gen_state == "drafting":
-            self._fill(self.gtext, [("Drafting an answer from your prepared answers…", "dim")])
+            self._fill(self.gtext, [(self.gen_note or "Drafting an answer from your prepared answers…", "dim")])
         elif self.gen_state in ("error", "off") and self.gen_note:
             self._fill(self.gtext, [(self.gen_note, "dim")])
         elif not self.cfg.get("generate", True):
@@ -610,10 +618,15 @@ class Overlay:
         self.save_btn.configure(state="normal" if (self.gen_state == "done" and self.gen_text) else "disabled")
         color, text = MUTED, ""
         if self.gen_state == "drafting":
-            text = "drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else "")
+            text = ("rewording…  ·  it repeated a story you already told" if self.gen_reworded
+                    else "drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else ""))
         elif self.gen_state == "done":
-            text = (f"{self.gen_summary}  ·  {self.gen_seconds:.1f}s" + (f"  ·  {self.gen_model}" if self.gen_model else "")
-                    + ("  ·  cut short" if self.gen_truncated else ""))
+            text = (f"{self.gen_summary}  ·  about {self.gen_spoken:.0f}s to say  ·  {self.gen_seconds:.1f}s"
+                    + (f"  ·  {self.gen_model}" if self.gen_model else "")
+                    + ("  ·  trimmed to length" if self.gen_trimmed else "")
+                    + ("  ·  cut short" if self.gen_truncated else "")
+                    + ("  ·  reworded: the first try repeated an earlier story" if self.gen_reworded and not self.gen_similar else "")
+                    + ("  ·  may still resemble an earlier story" if self.gen_similar else ""))
         elif self.gen_state in ("error", "off") and self.gen_note:
             color, text = WARN, self.gen_note
         self.gen_status.configure(text=text, fg=color)

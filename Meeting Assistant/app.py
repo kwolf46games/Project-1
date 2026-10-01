@@ -208,11 +208,17 @@ def cmd_generate(a) -> None:
                 state["first"] = time.monotonic() - started
             print(data, end="", flush=True)
         elif kind == "done":
-            print(f"\n\n[{data['seconds']:.1f}s total, first words after {data['first']:.1f}s; "
-                  f"{data['input_tokens']} tokens in, {data['output_tokens']} out"
+            print(f"\n\n[about {data['spoken']:.0f}s to say ({data['words']} words); "
+                  f"{data['seconds']:.1f}s to write, first words after {data['first']:.1f}s"
+                  + (f"; {data['input_tokens']} tokens in, {data['output_tokens']} out"
+                     if data["input_tokens"] or data["output_tokens"] else "")
                   + (f", {data['cached_tokens']} from cache" if data["cached_tokens"] else "")
-                  + (", cut short" if data["truncated"] else "") + "]")
+                  + (", cut short" if data["truncated"] else "")
+                  + (", trimmed to length" if data["trimmed"] else "")
+                  + (", reworded: it had repeated an earlier story" if data["reworded"] else "") + "]")
             done.set()
+        elif kind == "retry":
+            print(f"\n\n[{data}]\n")
         elif kind == "error":
             state["error"] = data
             print(f"\n{data}")
@@ -240,7 +246,7 @@ def cmd_generate(a) -> None:
             print(f"PROBLEM: {why}")
             return
         req = gen.Request([{"type": "text", "text": "Reply with the single word OK."}],
-                          [{"role": "user", "content": "ping"}], "connection check", "ping")
+                          [{"role": "user", "content": "ping"}], "connection check", "ping", repeat_ok=True)
         g.cfg = {**cfg, "generate_max_tokens": 200}
         g.start(req)
         done.wait(40)

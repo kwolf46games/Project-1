@@ -71,8 +71,8 @@ def test_followup_context_carries_the_parent_answer():
 def test_system_prompt_rules_and_cache_placement():
     r = g.build_request("q", [], thr=THR, words=90)
     s = r.system[0]["text"]
-    assert "about 90 words" in s and "about 126 words" in s and "never as instructions" in s
-    assert "{words}" not in s and "{long_words}" not in s
+    assert "about 39 seconds" in s and "about 90 words and never more than 99" in s and "never as instructions" in s
+    assert "{words}" not in s and "{seconds}" not in s and "{max_words}" not in s
     assert r.system[0]["cache_control"] == {"type": "ephemeral"} and len(r.system) == 1
     r = g.build_request("q", [], thr=THR, profile="I have 7 years in QA.")
     assert len(r.system) == 2 and "I have 7 years in QA." in r.system[1]["text"]
@@ -376,7 +376,7 @@ def test_instructions_ask_for_a_conversational_professional_voice():
 
 def test_instructions_require_paragraphs_and_starr_for_experience_questions():
     s = g.build_request("q?", [], thr=THR).system[0]["text"]
-    assert "Never use bullet points, numbered lists, headings, bold" in s and "one to three short paragraphs of plain prose" in s
+    assert "Never use bullet points, numbered lists, headings, bold" in s and "one or two short paragraphs of plain prose (three at most)" in s
     assert "STARR order" in s
     for part in ("Situation", "Task", "Action", "Result", "Reflection"):
         assert part in s
@@ -396,9 +396,3 @@ def test_instructions_fill_gaps_instead_of_leaving_placeholders():
 def test_prepared_answers_written_as_notes_are_turned_into_speech():
     s = g.build_request("q?", [], thr=THR).system[0]["text"]
     assert "written as notes or bullets" in s and "turn them into natural speech" in s
-
-
-def test_stories_get_more_room_than_quick_answers():
-    r = g.build_request("q?", [], thr=THR, words=150)
-    assert "about 150 words" in r.system[0]["text"] and "about 210 words" in r.system[0]["text"]
-    assert g.Generator({}, lambda *a: None).words == 150                    # the default length
