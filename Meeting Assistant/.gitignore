@@ -6,3 +6,4 @@ profile.md
 # generated
 __pycache__/
 .pytest_cache/
+last_error.txt

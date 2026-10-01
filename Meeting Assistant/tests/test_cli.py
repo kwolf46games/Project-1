@@ -299,8 +299,8 @@ def test_generate_check_with_groq_and_without_a_key(gen_cli, capsys, monkeypatch
 # ---------- setkey ----------
 
 def _type_key(monkeypatch, key):
-    import getpass
-    monkeypatch.setattr(getpass, "getpass", lambda prompt="": key)
+    import builtins
+    monkeypatch.setattr(builtins, "input", lambda prompt="": key)
 
 
 def test_setkey_saves_the_groq_key_and_tests_it(gen_cli, capsys, monkeypatch):
@@ -332,3 +332,26 @@ def test_setkey_refuses_the_wrong_kind_of_key_and_saves_nothing(gen_cli, monkeyp
     assert msg in str(e.value) and "Nothing was saved" in str(e.value)
     assert not gen.GROQ_KEY_FILE.exists() and not gen.KEY_FILE.exists()
     assert not typed.strip() or typed.strip() not in str(e.value)                         # never echoed back
+
+
+def test_setkey_cancelled_with_ctrl_c_or_closed_input_saves_nothing(gen_cli, monkeypatch):
+    import builtins
+    for exc in (KeyboardInterrupt, EOFError):
+        def boom(prompt="", exc=exc):
+            raise exc()
+        monkeypatch.setattr(builtins, "input", boom)
+        with pytest.raises(SystemExit) as e:
+            app.main(["setkey"])
+        assert "Cancelled. Nothing was saved." in str(e.value)
+    assert not gen.GROQ_KEY_FILE.exists()
+
+
+def test_an_unexpected_crash_is_shown_and_saved_not_swallowed(gen_cli, capsys, monkeypatch):
+    monkeypatch.setattr(b, "ROOT", gen_cli.parent)
+    monkeypatch.setattr(app, "cmd_devices", lambda a: (_ for _ in ()).throw(RuntimeError("sound card exploded")))
+    with pytest.raises(SystemExit) as e:
+        app.main(["devices"])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "sound card exploded" in out and "saved to last_error.txt" in out
+    assert "sound card exploded" in (gen_cli.parent / "last_error.txt").read_text(encoding="utf-8")

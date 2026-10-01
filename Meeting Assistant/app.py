@@ -18,6 +18,7 @@
   it generate --check                     live check of your API key and connection
   it generate --models                    list the models your Groq key can use (for generate_model)
   it setkey [groq|anthropic]              save your API key (asks you to paste it; or double-click "Set Up Drafting.bat")
+                                          then double-click "Test Drafting.bat" to check it works
   it devices                              list audio outputs that can be captured
   it audiotest [--seconds 10]             check live that audio arrives and is turned into text
   it transcribe FILE.wav [--match]        run a recording through the same audio -> text -> answer chain
@@ -278,13 +279,16 @@ def cmd_generate(a) -> None:
 
 
 def cmd_setkey(a) -> None:
-    import getpass
-
     import generate as gen
     groq = a.provider == "groq"
     path, prefix = (gen.GROQ_KEY_FILE, "gsk_") if groq else (gen.KEY_FILE, "sk-ant-")
     name = "Groq" if groq else "Anthropic"
-    key = getpass.getpass(f"Paste your {name} API key (nothing shows as you type), then press Enter: ").strip().strip("\"'")
+    print(f"Paste your {name} API key below (in this window, right-click pastes), then press Enter.")
+    print("It will be visible on screen while you do this.\n")
+    try:
+        key = input("> ").strip().strip("\"'")
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError("Cancelled. Nothing was saved.")
     if not key:
         raise ValueError("No key entered. Nothing was saved.")
     if not key.startswith(prefix):
@@ -454,6 +458,16 @@ def main(argv: list[str] | None = None) -> None:
              "generate": cmd_generate, "setkey": cmd_setkey, "audiotest": cmd_audiotest, "transcribe": cmd_transcribe}[a.cmd](a)
     except (KeyError, ValueError) as e:
         sys.exit(f"Error: {e.args[0] if e.args else e}")
+    except Exception:  # noqa: BLE001 - never vanish: show it, and save it where it can be sent
+        import traceback
+        text = traceback.format_exc()
+        print(text)
+        try:
+            (b.ROOT / "last_error.txt").write_text(text, encoding="utf-8")
+            print("These details were also saved to last_error.txt in the app folder.")
+        except OSError:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
