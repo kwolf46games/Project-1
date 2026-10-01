@@ -294,3 +294,41 @@ def test_generate_check_with_groq_and_without_a_key(gen_cli, capsys, monkeypatch
     app.main(["generate", "--check"])
     out = capsys.readouterr().out
     assert "provider: groq" in out and "key: GROQ_API_KEY" in out and "OK: the API key and connection work." in out
+
+
+# ---------- setkey ----------
+
+def _type_key(monkeypatch, key):
+    import getpass
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": key)
+
+
+def test_setkey_saves_the_groq_key_and_tests_it(gen_cli, capsys, monkeypatch):
+    _type_key(monkeypatch, '  "gsk_secret123"  ')
+    _groq_generator(monkeypatch, pieces=("OK",))
+    app.main(["setkey"])
+    assert gen.GROQ_KEY_FILE.read_text(encoding="utf-8") == "gsk_secret123\n"             # tidied: spaces and quotes removed
+    out = capsys.readouterr().out
+    assert "Saved to no_groq_key.txt" in out and "never uploaded" in out and "gsk_secret123" not in out
+    assert "OK: the API key and connection work." in out                                    # tested straight away
+
+
+def test_setkey_for_anthropic(gen_cli, capsys, monkeypatch):
+    _type_key(monkeypatch, "sk-ant-api03-abc")
+    _fake_generator(monkeypatch, pieces=["OK"])
+    app.main(["setkey", "anthropic"])
+    assert gen.KEY_FILE.read_text(encoding="utf-8") == "sk-ant-api03-abc\n"
+
+
+@pytest.mark.parametrize("typed,provider,msg", [
+    ("sk-ant-wrongone", "groq", "doesn't look like a Groq key"),
+    ("gsk_wrongone", "anthropic", "doesn't look like a Anthropic key"),
+    ("   ", "groq", "No key entered"),
+])
+def test_setkey_refuses_the_wrong_kind_of_key_and_saves_nothing(gen_cli, monkeypatch, typed, provider, msg):
+    _type_key(monkeypatch, typed)
+    with pytest.raises(SystemExit) as e:
+        app.main(["setkey", provider])
+    assert msg in str(e.value) and "Nothing was saved" in str(e.value)
+    assert not gen.GROQ_KEY_FILE.exists() and not gen.KEY_FILE.exists()
+    assert not typed.strip() or typed.strip() not in str(e.value)                         # never echoed back

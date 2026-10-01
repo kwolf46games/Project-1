@@ -17,6 +17,7 @@
   it generate "a question"                draft an answer from your banks (needs a Groq or Anthropic API key)
   it generate --check                     live check of your API key and connection
   it generate --models                    list the models your Groq key can use (for generate_model)
+  it setkey [groq|anthropic]              save your API key (asks you to paste it; or double-click "Set Up Drafting.bat")
   it devices                              list audio outputs that can be captured
   it audiotest [--seconds 10]             check live that audio arrives and is turned into text
   it transcribe FILE.wav [--match]        run a recording through the same audio -> text -> answer chain
@@ -276,6 +277,28 @@ def cmd_generate(a) -> None:
     done.wait(90)
 
 
+def cmd_setkey(a) -> None:
+    import getpass
+
+    import generate as gen
+    groq = a.provider == "groq"
+    path, prefix = (gen.GROQ_KEY_FILE, "gsk_") if groq else (gen.KEY_FILE, "sk-ant-")
+    name = "Groq" if groq else "Anthropic"
+    key = getpass.getpass(f"Paste your {name} API key (nothing shows as you type), then press Enter: ").strip().strip("\"'")
+    if not key:
+        raise ValueError("No key entered. Nothing was saved.")
+    if not key.startswith(prefix):
+        raise ValueError(f"That doesn't look like a {name} key ({name} keys start with '{prefix}'). Nothing was saved.")
+    path.write_text(key + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)           # keep it private on systems that support it
+    except OSError:
+        pass
+    print(f"Saved to {path.name} (next to the app; it is never uploaded to GitHub). You won't need to do this again.\n")
+    print("Testing it now...\n")
+    cmd_generate(argparse.Namespace(text=None, check=True, models=False, after=None, show_prompt=False))
+
+
 def cmd_devices(_a) -> None:
     from audio import list_loopback_devices
     for d in list_loopback_devices():
@@ -391,6 +414,8 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--show-prompt", action="store_true", help="print exactly what is sent to the API")
     x.add_argument("--check", action="store_true", help="test the API key and connection with a tiny request")
     x.add_argument("--models", action="store_true", help="list the models your Groq key can use")
+    x = sub.add_parser("setkey")
+    x.add_argument("provider", nargs="?", default="groq", choices=["groq", "anthropic"])
     x = sub.add_parser("audiotest")
     x.add_argument("--seconds", type=int, default=10)
     x = sub.add_parser("transcribe")
@@ -426,7 +451,7 @@ def main(argv: list[str] | None = None) -> None:
             Overlay().run()
         else:
             {"banks": cmd_banks, "q": cmd_q, "test": cmd_test, "devices": cmd_devices, "suggest": cmd_suggest,
-             "generate": cmd_generate, "audiotest": cmd_audiotest, "transcribe": cmd_transcribe}[a.cmd](a)
+             "generate": cmd_generate, "setkey": cmd_setkey, "audiotest": cmd_audiotest, "transcribe": cmd_transcribe}[a.cmd](a)
     except (KeyError, ValueError) as e:
         sys.exit(f"Error: {e.args[0] if e.args else e}")
 
