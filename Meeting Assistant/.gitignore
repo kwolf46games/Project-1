@@ -1,5 +1,6 @@
 # secrets and personal details: never commit these
 anthropic_key.txt
+groq_key.txt
 profile.md
 
 # generated

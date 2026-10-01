@@ -14,8 +14,9 @@
   it test "what was the outcome?" --after "Tell me about yourself"
                                           ...as a follow-up to an answer that was just shown
   it suggest BANK [N|TEXT] [--apply]      suggest extra phrasings for each question (--apply adds the safe ones)
-  it generate "a question"                draft an answer from your banks (needs the anthropic package + an API key)
+  it generate "a question"                draft an answer from your banks (needs a Groq or Anthropic API key)
   it generate --check                     live check of your API key and connection
+  it generate --models                    list the models your Groq key can use (for generate_model)
   it devices                              list audio outputs that can be captured
   it audiotest [--seconds 10]             check live that audio arrives and is turned into text
   it transcribe FILE.wav [--match]        run a recording through the same audio -> text -> answer chain
@@ -199,7 +200,7 @@ def cmd_generate(a) -> None:
 
     def on_event(job, kind, data) -> None:
         if kind == "start":
-            print(f"({data})\n")
+            print(f"({data}; {g.provider}: {g.model})\n")
         elif kind == "delta":
             if state["first"] is None:
                 state["first"] = time.monotonic() - started
@@ -215,11 +216,24 @@ def cmd_generate(a) -> None:
             print(f"\n{data}")
             done.set()
     g = gen.Generator(cfg, on_event)
+    if a.models:
+        if g.provider != "groq":
+            raise ValueError("--models lists Groq's models; with Anthropic set generate_model to a Claude model id.")
+        for name, ctx in g.list_models():
+            print(f"  {name:<46} {ctx:>8} tokens of context")
+        print('\nTo pin one, set "generate_model" in config.json.')
+        return
     if a.check:
         ok, why = g.status()
-        key = ("ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY")
-               else f"{gen.KEY_FILE.name}" if gen.KEY_FILE.exists() else "none found (the SDK will try its own sources)")
-        print(f"package: {'ok' if ok or 'package' not in why else 'MISSING - ' + why}\nkey: {key}\nmodel: {g.model}")
+        if g.provider == "groq":
+            key = ("GROQ_API_KEY" if os.environ.get("GROQ_API_KEY") else gen.GROQ_KEY_FILE.name
+                   if gen.GROQ_KEY_FILE.exists() else "none found")
+            print(f"provider: groq (no extra package needed)\nkey: {key}\nmodel: {g.model}")
+        else:
+            key = ("ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY") else gen.KEY_FILE.name
+                   if gen.KEY_FILE.exists() else "none found (the SDK will try its own sources)")
+            print(f"provider: anthropic\npackage: {'ok' if ok or 'package' not in why else 'MISSING'}\n"
+                  f"key: {key}\nmodel: {g.model}")
         if not ok:
             print(f"PROBLEM: {why}")
             return
@@ -376,6 +390,7 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--after", help="part of the question whose answer is on screen (to draft a follow-up)")
     x.add_argument("--show-prompt", action="store_true", help="print exactly what is sent to the API")
     x.add_argument("--check", action="store_true", help="test the API key and connection with a tiny request")
+    x.add_argument("--models", action="store_true", help="list the models your Groq key can use")
     x = sub.add_parser("audiotest")
     x.add_argument("--seconds", type=int, default=10)
     x = sub.add_parser("transcribe")

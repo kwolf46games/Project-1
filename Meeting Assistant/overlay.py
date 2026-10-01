@@ -56,6 +56,7 @@ class Overlay:
         self.gen_note = ""
         self.gen_summary = ""
         self.gen_seconds = 0.0
+        self.gen_model = ""
         self.gen_truncated = False
         self._gen_floor = 0                   # events from jobs up to this id are stale
         self._gen_job = 0
@@ -528,6 +529,7 @@ class Overlay:
         elif kind == "done":
             self.gen_text = (data.get("text") or self.gen_text).strip()
             self.gen_state, self.gen_seconds = "done", float(data.get("seconds", 0.0))
+            self.gen_model = str(data.get("model", ""))
             self.gen_truncated = bool(data.get("truncated"))
             self._render_right()
         elif kind == "error":
@@ -588,7 +590,8 @@ class Overlay:
         if self.gen_state == "drafting":
             text = "✨ drafting…" + (f"  ·  {self.gen_summary}" if self.gen_summary else "")
         elif self.gen_state == "done":
-            text = f"✨ {self.gen_summary}  ·  {self.gen_seconds:.1f}s" + ("  ·  cut short" if self.gen_truncated else "")
+            text = (f"✨ {self.gen_summary}  ·  {self.gen_seconds:.1f}s" + (f"  ·  {self.gen_model}" if self.gen_model else "")
+                    + ("  ·  cut short" if self.gen_truncated else ""))
         elif self.gen_state in ("error", "off") and self.gen_note:
             color, text = WARN, self.gen_note
         elif self.view == "prepared" and self._prepared_md:

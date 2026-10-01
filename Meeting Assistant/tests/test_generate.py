@@ -315,7 +315,7 @@ def test_listener_bug_does_not_kill_the_worker():
 def test_status_reasons(monkeypatch):
     gen = g.Generator({"generate": False}, lambda *a: None, client_factory=lambda: None)
     assert gen.status() == (False, "Generated answers are switched off.")
-    gen = g.Generator({"generate": True}, lambda *a: None)
+    gen = g.Generator({"generate": True, "generate_provider": "anthropic"}, lambda *a: None)
     monkeypatch.setitem(sys.modules, "anthropic", None)                 # as if the package isn't installed
     ok, why = gen.status()
     assert not ok and "pip install anthropic" in why
@@ -326,7 +326,7 @@ def test_status_reasons(monkeypatch):
 def test_missing_package_is_reported_when_a_question_arrives(monkeypatch):
     monkeypatch.setitem(sys.modules, "anthropic", None)
     events, done = [], threading.Event()
-    gen = g.Generator({"generate": True}, lambda j, k, d: (events.append((k, d)), done.set()))
+    gen = g.Generator({"generate": True, "generate_provider": "anthropic"}, lambda j, k, d: (events.append((k, d)), done.set()))
     gen.start(g.build_request("q?", [], thr=THR))
     assert done.wait(3) and events[0][0] == "error" and "pip install anthropic" in events[0][1]
 

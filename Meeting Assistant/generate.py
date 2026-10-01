@@ -1,7 +1,7 @@
 """Draft the answer to what was just asked: your own prepared answers first, generation for the gaps.
 
 For every question heard, the closest answers from the active banks (plus an optional profile.md with
-facts about you) go to Claude, which writes what to SAY next:
+facts about you) go to a language model, which writes what to SAY next:
 
 * a question that lines up with a prepared answer gets that answer, lightly adapted;
 * one that only partly lines up gets the relevant parts combined, with the gap bridged;
@@ -10,25 +10,44 @@ facts about you) go to Claude, which writes what to SAY next:
 
 The prepared answer is still shown instantly; the draft streams in beside it.
 
+Two providers (config "generate_provider": "auto", "groq" or "anthropic"):
+
+* Groq      - key in the GROQ_API_KEY environment variable or in groq_key.txt next to this file.
+              Needs nothing extra installed.
+* Anthropic - key in ANTHROPIC_API_KEY or anthropic_key.txt, and `pip install anthropic`.
+
+"auto" uses Groq if you have a Groq key, otherwise Anthropic.
+
 What is sent: the heard question, the few prepared answers closest to it, your profile.md, and the
-last couple of answers shown.  Nothing else (no audio).  Needs the `anthropic` package and an API key
-in the ANTHROPIC_API_KEY environment variable or in anthropic_key.txt next to this file.
+last answer shown.  Nothing else (no audio).
 """
 from __future__ import annotations
 
+import http.client
 import importlib.util
+import json
 import os
+import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 from bank import ROOT, Entry
 from matcher import Match
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "claude-opus-5-5"                  # Anthropic
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+GROQ_URL = "https://api.groq.com/openai/v1"
+GROQ_PREFERRED = ("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-70b-versatile",
+                  "openai/gpt-oss-20b", "llama-3.1-8b-instant")
+GROQ_NOT_CHAT = ("whisper", "guard", "tts", "playai", "orpheus", "safeguard", "embed", "distil-whisper")
 KEY_FILE = ROOT / "anthropic_key.txt"
+GROQ_KEY_FILE = ROOT / "groq_key.txt"
 PROFILE_FILE = ROOT / "profile.md"
+USER_AGENT = "meeting-assistant/1.0"               # Groq sits behind Cloudflare, which rejects Python's default
 MAX_ANSWER_CHARS = 2500      # per prepared answer sent
 MAX_PROFILE_CHARS = 6000
 RELATED_FLOOR = 0.25         # a prepared answer this far below the match threshold is no longer "related"
@@ -136,8 +155,84 @@ def build_request(heard: str, matches: Sequence[Match], *, thr: float, words: in
                    [m.entry for m in used])
 
 
+def _read_key_file(path) -> str:
+    try:
+        return next((ln.strip() for ln in path.read_text(encoding="utf-8-sig").splitlines()
+                     if ln.strip() and not ln.lstrip().startswith("#")), "")
+    except OSError:
+        return ""
+
+
+def groq_key() -> str:
+    return os.environ.get("GROQ_API_KEY", "").strip() or _read_key_file(GROQ_KEY_FILE)
+
+
+def anthropic_key_present() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                or _read_key_file(KEY_FILE))
+
+
+class GroqError(Exception):
+    """An error answer from the Groq API (HTTP status plus the message it sent)."""
+
+    def __init__(self, status: int, message: str, retry_after: float | None = None, code: str = "") -> None:
+        super().__init__(message)
+        self.status, self.message, self.retry_after, self.code = status, message, retry_after, code
+
+
+def _groq_http_error(e: urllib.error.HTTPError) -> GroqError:
+    message, code = "", ""
+    try:
+        body = json.loads(e.read().decode("utf-8", "replace"))
+        err = body.get("error", body) if isinstance(body, dict) else {}
+        message, code = str(err.get("message", "")), str(err.get("code", "") or err.get("type", ""))
+    except Exception:  # noqa: BLE001 - an HTML error page from the network in the way, say
+        pass
+    retry = None
+    try:
+        retry = float(e.headers.get("retry-after")) if e.headers and e.headers.get("retry-after") else None
+    except ValueError:
+        pass
+    return GroqError(e.code, message or e.reason or "", retry, code)
+
+
+_PREAMBLE = re.compile(r"^(here(?:'s| is| are)\b|sure[,!. ]|certainly[,!. ]|of course[,!. ]|okay[,!. ]).{0,80}[:!]\s*$", re.I)
+
+
+def tidy_draft(text: str) -> str:
+    """Models sometimes wrap an answer in chatter ("Here's an answer:") or quotation marks. The user reads
+    the draft out loud, so take both off."""
+    text = text.strip()
+    lines = text.splitlines()
+    if len(lines) > 1 and _PREAMBLE.match(lines[0].strip()):
+        text = "\n".join(lines[1:]).strip()
+    if len(text) > 1 and text[0] in "\"\u201c" and text[-1] in "\"\u201d" and text[1:-1].count('"') == 0:
+        text = text[1:-1].strip()
+    return text
+
+
 def explain_error(e: BaseException) -> tuple[str, bool]:
     """(what to tell the user, whether it will keep failing until they change something)."""
+    if isinstance(e, GroqError):
+        low = f"{e.message} {e.code}".lower()
+        if e.status == 401:
+            return "The Groq key was rejected. Check GROQ_API_KEY or groq_key.txt.", True
+        if e.status == 404 or "decommission" in low or "model_not_found" in low or "does not exist" in low:
+            return "That Groq model isn't available. Run  it generate --models  and set generate_model.", True
+        if e.status == 429:
+            wait = f" Try again in {e.retry_after:.0f}s." if e.retry_after else ""
+            return "Groq's rate limit was reached." + wait, False
+        if e.status == 403:
+            return "Groq refused the request (403): the key lacks access, or a network filter blocks api.groq.com.", False
+        if e.status == 413 or "too large" in low or "reduce your message" in low:
+            return "That request is too large for the model's limit.", False
+        if e.status >= 500:
+            return f"The API is having trouble ({e.status}). Try again.", False
+        if "credit" in low or "billing" in low or "quota" in low:
+            return "The Groq account is out of quota.", True
+        return f"The API refused the request: {e.message[:120]}", False
+    if isinstance(e, (OSError, http.client.HTTPException)):          # offline, DNS, reset, timeout
+        return "Couldn't reach the API (offline?). The prepared answer is still here.", False
     name = type(e).__name__
     msg = str(getattr(e, "message", "") or e)
     low = msg.lower()
@@ -161,62 +256,150 @@ def explain_error(e: BaseException) -> tuple[str, bool]:
     return f"Couldn't generate an answer ({name}: {msg[:100]}).", False
 
 
+class _ThinkFilter:
+    """Reasoning models may stream <think>...</think> inline; it is thinking, not the answer. Drop it,
+    even when a tag is split across two chunks."""
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self) -> None:
+        self.buf, self.inside = "", False
+
+    def feed(self, piece: str) -> str:
+        self.buf += piece
+        out: list[str] = []
+        while True:
+            if self.inside:
+                i = self.buf.find(self.CLOSE)
+                if i < 0:
+                    self.buf = self.buf[-(len(self.CLOSE) - 1):]
+                    break
+                self.buf, self.inside = self.buf[i + len(self.CLOSE):], False
+                continue
+            i = self.buf.find(self.OPEN)
+            if i >= 0:
+                out.append(self.buf[:i])
+                self.buf, self.inside = self.buf[i + len(self.OPEN):], True
+                continue
+            keep = next((n for n in range(len(self.OPEN) - 1, 0, -1) if self.buf.endswith(self.OPEN[:n])), 0)
+            out.append(self.buf[:len(self.buf) - keep])
+            self.buf = self.buf[len(self.buf) - keep:]
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        out = "" if self.inside else self.buf
+        self.buf = ""
+        return out
+
+
+class _Run:
+    """The text of one drafting job as it arrives."""
+
+    def __init__(self, gen: "Generator", job: int) -> None:
+        self.gen, self.job, self.parts, self.first, self.t0 = gen, job, [], None, time.monotonic()
+
+    def push(self, piece: str) -> bool:
+        """Deliver a piece; False means a newer question replaced this job, so stop."""
+        if not self.parts:
+            piece = piece.lstrip()
+            if not piece:
+                return self.gen._current(self.job)
+        if not self.gen._current(self.job):
+            return False
+        if self.first is None:
+            self.first = time.monotonic() - self.t0
+        self.parts.append(piece)
+        self.gen._emit(self.job, "delta", piece)
+        return True
+
+
 class Generator:
     """Runs one drafting job at a time on a background thread; a newer job silently replaces an older one.
 
     on_event(job, kind, data) is called from the worker thread with kind in:
-      "start" (data: one-line summary), "delta" (data: new text), "done" (data: dict), "error" (data: message)."""
+      "start" (data: one-line summary), "delta" (data: new text), "done" (data: dict), "error" (data: message).
 
-    def __init__(self, cfg: dict, on_event: Callable[[int, str, object], None], client_factory=None) -> None:
+    `client_factory` (an Anthropic-style client) and `http` (a function taking the Groq request payload and
+    returning the response's server-sent-event data lines) exist so tests can run without a network."""
+
+    def __init__(self, cfg: dict, on_event: Callable[[int, str, object], None], client_factory=None,
+                 http=None) -> None:
         self.cfg, self.on_event = cfg, on_event
         self._injected = client_factory is not None
+        self._http = http
         self._client_factory = client_factory or self._default_client
         self._client = None
         self._client_lock = threading.Lock()
         self._lock = threading.Lock()
         self._job = 0
+        self._groq_model_pick = ""
         self.disabled_reason = ""          # set after a failure that will repeat (bad or missing key)
         self.profile = load_profile()
 
-    # ----- availability -----
+    # ----- which provider, which model -----
+    @property
+    def provider(self) -> str:
+        if self._injected:
+            return "anthropic"
+        if self._http is not None:
+            return "groq"
+        choice = str(self.cfg.get("generate_provider", "auto")).strip().lower()
+        if choice in ("groq", "anthropic"):
+            return choice
+        return "groq" if groq_key() else "anthropic"
+
     @property
     def model(self) -> str:
-        return str(self.cfg.get("generate_model") or DEFAULT_MODEL)
+        want = str(self.cfg.get("generate_model") or "").strip()
+        if self.provider == "groq":
+            if want and not want.lower().startswith("claude"):
+                return want
+            return self._groq_model_pick or GROQ_DEFAULT_MODEL
+        return want or DEFAULT_MODEL
 
     @property
     def words(self) -> int:
         return int(self.cfg.get("generate_words", 130))
 
     def status(self) -> tuple[bool, str]:
-        """(usable, why not). Switched on in config, SDK present, and no repeating failure so far."""
+        """(usable, why not). Switched on in config, a key present, and no repeating failure so far."""
         if not self.cfg.get("generate", True):
             return False, "Generated answers are switched off."
         if self.disabled_reason:
             return False, self.disabled_reason
-        if not self._injected:
-            try:
-                present = importlib.util.find_spec("anthropic") is not None   # a look, not an import: stays instant
-            except (ImportError, ValueError):
-                present = False
-            if not present:
-                return False, "Generated answers need the 'anthropic' package: run  pip install anthropic"
+        if self._injected:
+            return True, ""
+        auto = str(self.cfg.get("generate_provider", "auto")).strip().lower() not in ("groq", "anthropic")
+        if self.provider == "groq":
+            if self._http is None and not groq_key():
+                return False, "No Groq key found. Set GROQ_API_KEY or put the key in groq_key.txt."
+            return True, ""
+        if auto and not anthropic_key_present():
+            return False, ("Drafting needs an API key: put a Groq key in groq_key.txt (or GROQ_API_KEY), "
+                           "or an Anthropic key in anthropic_key.txt.")
+        try:
+            present = importlib.util.find_spec("anthropic") is not None   # a look, not an import: stays instant
+        except (ImportError, ValueError):
+            present = False
+        if not present:
+            return False, "Generated answers with Anthropic need the 'anthropic' package: run  pip install anthropic"
         return True, ""
 
     def _default_client(self):
         import anthropic
         kw = {"timeout": 25.0, "max_retries": 1}
         if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-            try:
-                key = next((ln.strip() for ln in KEY_FILE.read_text(encoding="utf-8-sig").splitlines()
-                            if ln.strip() and not ln.lstrip().startswith("#")), "")
-            except OSError:
-                key = ""
+            key = _read_key_file(KEY_FILE)
             if key:
                 kw["api_key"] = key
         return anthropic.Anthropic(**kw)
 
     def warm(self) -> None:
-        """Build the client ahead of the first question (importing the SDK takes a moment)."""
+        """Get ready ahead of the first question (importing the Anthropic SDK takes a moment)."""
+        if self.provider != "anthropic":
+            return
+
         def work():
             try:
                 self._get_client()
@@ -252,11 +435,6 @@ class Generator:
             except Exception:  # noqa: BLE001 - never let the screen's bug kill the worker
                 pass
 
-    def _kwargs(self, request: Request) -> dict:
-        return dict(model=self.model, max_tokens=int(self.cfg.get("generate_max_tokens", 4000)),
-                    system=request.system, messages=request.messages,
-                    output_config={"effort": str(self.cfg.get("generate_effort", "low"))})
-
     def _run(self, job: int, request: Request, delay: float) -> None:
         end = time.monotonic() + delay
         while time.monotonic() < end:           # a debounce: a newer question during the wait replaces this one
@@ -268,39 +446,150 @@ class Generator:
             self._emit(job, "error", why)
             return
         self._emit(job, "start", request.summary)
-        t0 = time.monotonic()
-        parts: list[str] = []
-        first = None
+        run = _Run(self, job)
         try:
-            client = self._get_client()
-            kw = self._kwargs(request)
-            try:
-                ctx = client.messages.stream(**kw)
-            except TypeError:            # an SDK that predates output_config: pass it through the body instead
-                effort = kw.pop("output_config")
-                ctx = client.messages.stream(**kw, extra_body={"output_config": effort})
-            with ctx as stream:
-                for piece in stream.text_stream:
-                    if not self._current(job):
-                        return
-                    if first is None:
-                        first = time.monotonic() - t0
-                    parts.append(piece)
-                    self._emit(job, "delta", piece)
-                final = stream.get_final_message()
+            meta = self._stream_groq(run, request) if self.provider == "groq" else self._stream_anthropic(run, request)
         except Exception as e:  # noqa: BLE001 - every failure becomes a message on screen, never a crash
             message, repeats = explain_error(e)
             if repeats:
                 self.disabled_reason = message
             self._emit(job, "error", message)
             return
-        stop = getattr(final, "stop_reason", None)
-        if stop == "refusal":
+        if meta is None:                        # superseded while streaming
+            return
+        if meta.get("stop") == "refusal":
             self._emit(job, "error", "The model declined to answer that one.")
             return
-        usage = getattr(final, "usage", None)
+        usage = meta.get("usage", {})
         self._emit(job, "done", {
-            "text": "".join(parts), "seconds": time.monotonic() - t0, "first": first or 0.0,
-            "truncated": stop == "max_tokens",
-            "input_tokens": getattr(usage, "input_tokens", 0), "output_tokens": getattr(usage, "output_tokens", 0),
-            "cached_tokens": getattr(usage, "cache_read_input_tokens", 0)})
+            "text": tidy_draft("".join(run.parts)), "seconds": time.monotonic() - run.t0, "first": run.first or 0.0,
+            "truncated": meta.get("stop") in ("max_tokens", "length"), "model": self.model,
+            "provider": self.provider, "input_tokens": usage.get("input", 0), "output_tokens": usage.get("output", 0),
+            "cached_tokens": usage.get("cached", 0)})
+
+    # ----- Anthropic -----
+    def _stream_anthropic(self, run: _Run, request: Request):
+        client = self._get_client()
+        kw = dict(model=self.model, max_tokens=int(self.cfg.get("generate_max_tokens", 4000)),
+                  system=request.system, messages=request.messages,
+                  output_config={"effort": str(self.cfg.get("generate_effort", "low"))})
+        try:
+            ctx = client.messages.stream(**kw)
+        except TypeError:            # an SDK that predates output_config: pass it through the body instead
+            effort = kw.pop("output_config")
+            ctx = client.messages.stream(**kw, extra_body={"output_config": effort})
+        with ctx as stream:
+            for piece in stream.text_stream:
+                if not run.push(piece):
+                    return None
+            final = stream.get_final_message()
+        u = getattr(final, "usage", None)
+        return {"stop": getattr(final, "stop_reason", None),
+                "usage": {"input": getattr(u, "input_tokens", 0), "output": getattr(u, "output_tokens", 0),
+                          "cached": getattr(u, "cache_read_input_tokens", 0)}}
+
+    # ----- Groq (OpenAI-style chat completions over server-sent events; standard library only) -----
+    def _groq_base(self) -> str:
+        return str(self.cfg.get("groq_base_url") or GROQ_URL).rstrip("/")
+
+    def _groq_headers(self) -> dict:
+        return {"Authorization": f"Bearer {groq_key()}", "Content-Type": "application/json",
+                "Accept": "text/event-stream", "User-Agent": USER_AGENT}
+
+    def _groq_payload(self, request: Request) -> dict:
+        system = "\n\n".join(blk["text"] for blk in request.system)
+        return {"model": self.model, "stream": True, "temperature": 0.4,
+                "max_tokens": int(self.cfg.get("generate_max_tokens", 4000)),
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "system", "content": system}, *request.messages]}
+
+    def _groq_lines(self, payload: dict):
+        """Yield the `data:` payloads of one streamed response."""
+        if self._http is not None:
+            yield from self._http(payload)
+            return
+        req = urllib.request.Request(self._groq_base() + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
+                                     headers=self._groq_headers(), method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=25)
+        except urllib.error.HTTPError as e:
+            raise _groq_http_error(e) from None
+        try:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if line.startswith("data:"):
+                    yield line[5:].strip()
+        finally:
+            resp.close()
+
+    def _groq_models(self) -> list[dict]:
+        """The models this key can use (used to pick a replacement when the default has been retired)."""
+        req = urllib.request.Request(self._groq_base() + "/models", headers=self._groq_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("data", [])
+        except urllib.error.HTTPError as e:
+            raise _groq_http_error(e) from None
+
+    def list_models(self) -> list[tuple[str, int]]:
+        out = [(m["id"], int(m.get("context_window") or 0)) for m in self._groq_models()
+               if m.get("active", True) and not any(w in m["id"].lower() for w in GROQ_NOT_CHAT)]
+        return sorted(out)
+
+    def _pick_groq_model(self) -> str:
+        ids = {i: c for i, c in self.list_models()}
+        for want in GROQ_PREFERRED:
+            if want in ids:
+                return want
+        return max(ids, key=ids.get) if ids else ""
+
+    def _stream_groq(self, run: _Run, request: Request):
+        try:
+            return self._stream_groq_once(run, request)
+        except GroqError as e:
+            retired = e.status == 404 or "decommission" in f"{e.message} {e.code}".lower() or "model_not_found" in e.code
+            if not retired or self._http is not None or str(self.cfg.get("generate_model") or "").strip():
+                raise            # a model the user chose themselves is theirs to fix
+            pick = self._pick_groq_model()
+            if not pick or pick == self.model:
+                raise
+            self._groq_model_pick = pick   # the default was retired: use what this key can actually run
+            return self._stream_groq_once(run, request)
+
+    def _stream_groq_once(self, run: _Run, request: Request):
+        meta: dict = {"stop": None, "usage": {}}
+        flt = _ThinkFilter()
+        lines = self._groq_lines(self._groq_payload(request))
+        try:
+            for data in lines:
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    err = chunk["error"]
+                    raise GroqError(int(err.get("status", 500) or 500), str(err.get("message", "")),
+                                    code=str(err.get("code", "")))
+                usage = chunk.get("usage") or (chunk.get("x_groq") or {}).get("usage")
+                if usage:
+                    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                    meta["usage"] = {"input": usage.get("prompt_tokens", 0), "output": usage.get("completion_tokens", 0),
+                                     "cached": cached or 0}
+                for choice in chunk.get("choices") or []:
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece:
+                        visible = flt.feed(piece)
+                        if visible and not run.push(visible):
+                            return None
+                    if choice.get("finish_reason"):
+                        meta["stop"] = choice["finish_reason"]
+        finally:
+            close = getattr(lines, "close", None)
+            if close:
+                close()
+        tail = flt.flush()
+        if tail and not run.push(tail):
+            return None
+        return meta

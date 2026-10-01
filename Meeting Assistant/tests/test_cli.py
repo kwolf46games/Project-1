@@ -172,7 +172,10 @@ def _fake_generator(monkeypatch, pieces=("**Own it.** ", "I {{verb}} well."), fa
 
 @pytest.fixture
 def gen_cli(cli, monkeypatch):
+    for var in ("GROQ_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(gen, "KEY_FILE", cli / "no_key.txt")
+    monkeypatch.setattr(gen, "GROQ_KEY_FILE", cli / "no_groq_key.txt")
     monkeypatch.setattr(gen, "PROFILE_FILE", cli / "no_profile.md")
     return cli
 
@@ -181,7 +184,7 @@ def test_generate_prints_the_streamed_draft_and_timing(gen_cli, capsys, monkeypa
     client = _fake_generator(monkeypatch)
     app.main(["generate", "Tell me about a time you led a team?"])
     out = capsys.readouterr().out
-    assert "(adapted from your prepared answer)" in out and "**Own it.** I {{verb}} well." in out
+    assert "(adapted from your prepared answer; anthropic: claude-opus-5-5)" in out and "**Own it.** I {{verb}} well." in out
     assert "tokens in" in out and "first words after" in out
     sent = client.calls[0]["messages"][0]["content"]
     assert "led a team" in sent and "LEAD" in sent
@@ -212,6 +215,7 @@ def test_generate_needs_a_question(gen_cli, monkeypatch):
 def test_generate_explains_a_missing_package(gen_cli, monkeypatch):
     monkeypatch.setattr(gen, "Generator", RealGenerator)               # the real one, with no client injected
     monkeypatch.setitem(sys.modules, "anthropic", None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
     with pytest.raises(SystemExit) as e:
         app.main(["generate", "Tell me about yourself?"])
     assert "pip install anthropic" in str(e.value)
@@ -227,3 +231,66 @@ def test_generate_check_reports_success_and_failure(gen_cli, capsys, monkeypatch
     app.main(["generate", "--check"])
     out = capsys.readouterr().out
     assert "key was rejected" in out and "OK: the API key" not in out
+
+
+# ---------- generate with Groq ----------
+
+def _groq_generator(monkeypatch, pieces=("Own ", "it."), models=None):
+    import json
+
+    def http(payload):
+        for piece in pieces:
+            yield json.dumps({"choices": [{"delta": {"content": piece}, "finish_reason": None}]})
+        yield json.dumps({"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 4}})
+        yield "[DONE]"
+    sent = []
+
+    class Fake(RealGenerator):
+        def list_models(self):
+            return models or []
+    monkeypatch.setattr(gen, "Generator", lambda cfg, on_event: Fake(cfg, on_event, http=lambda p: (sent.append(p), http(p))[1]))
+    return sent
+
+
+def test_generate_with_a_groq_key_uses_groq(gen_cli, capsys, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    http_calls = []
+
+    def http(payload):
+        import json
+        http_calls.append(payload)
+        yield json.dumps({"choices": [{"delta": {"content": "Own it."}, "finish_reason": "stop"}]})
+        yield "[DONE]"
+    monkeypatch.setattr(gen, "Generator", lambda cfg, on_event: RealGenerator(cfg, on_event, http=http))
+    app.main(["generate", "Tell me about a time you led a team?"])
+    out = capsys.readouterr().out
+    assert "groq: llama-3.3-70b-versatile" in out and "Own it." in out
+    assert http_calls[0]["messages"][0]["role"] == "system" and "led a team" in http_calls[0]["messages"][1]["content"]
+
+
+def test_generate_models_lists_groq_models(gen_cli, capsys, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    _groq_generator(monkeypatch, models=[("llama-3.3-70b-versatile", 131072), ("openai/gpt-oss-20b", 65536)])
+    app.main(["generate", "--models"])
+    out = capsys.readouterr().out
+    assert "llama-3.3-70b-versatile" in out and "131072" in out and "generate_model" in out
+
+
+def test_generate_models_needs_groq(gen_cli, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    _fake_generator(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        app.main(["generate", "--models"])
+    assert "lists Groq's models" in str(e.value)
+
+
+def test_generate_check_with_groq_and_without_a_key(gen_cli, capsys, monkeypatch):
+    monkeypatch.setattr(gen, "Generator", RealGenerator)
+    app.main(["generate", "--check"])
+    out = capsys.readouterr().out
+    assert "PROBLEM:" in out and "groq_key.txt" in out and "OK: the API key" not in out     # tells you where to put one
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    _groq_generator(monkeypatch, pieces=("OK",))
+    app.main(["generate", "--check"])
+    out = capsys.readouterr().out
+    assert "provider: groq" in out and "key: GROQ_API_KEY" in out and "OK: the API key and connection work." in out

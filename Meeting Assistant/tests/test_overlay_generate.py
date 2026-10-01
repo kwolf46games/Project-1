@@ -189,9 +189,11 @@ def test_missing_package_is_explained_on_screen(banks_dir, monkeypatch):
     import overlay
     banks_dir.mkdir(parents=True)
     b.Bank("demo", "Demo", [b.Entry("What is your biggest weakness?", "WEAK answer", bank="demo")]).save()
-    b.CONFIG_PATH.write_text(json.dumps({"active_banks": ["demo"], "generate": True}), encoding="utf-8")
+    b.CONFIG_PATH.write_text(json.dumps({"active_banks": ["demo"], "generate": True, "generate_provider": "anthropic"}),
+                             encoding="utf-8")
     monkeypatch.setattr(overlay, "Listener", FakeListener)
     monkeypatch.setattr(overlay, "Matcher", lambda: Matcher(embed_fn=fake_embed))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
     monkeypatch.setitem(sys.modules, "anthropic", None)
     o = overlay.Overlay()
     try:
@@ -255,6 +257,25 @@ def test_picking_an_answer_by_hand_stops_the_draft(ov, holder):
     assert pump(ov, lambda: ov.view == "prepared" and "WEAK answer" in body(ov))
     time.sleep(0.4)
     assert ov.gen_text == "" and ov.gen_state == "idle"
+
+
+def test_groq_draft_streams_beside_the_prepared_answer_and_names_its_model(ov):
+    sent = []
+
+    def http(payload):
+        sent.append(payload)
+        for piece in ("**Listen first.** ", "Then {{your example}}."):
+            yield json.dumps({"choices": [{"delta": {"content": piece}, "finish_reason": None}]})
+        yield json.dumps({"choices": [], "usage": {"prompt_tokens": 600, "completion_tokens": 20}})
+        yield "[DONE]"
+    ov.gen = g.Generator(ov.cfg, lambda job, kind, data: ov.events.put(("gen", (job, kind, data))), http=http)
+    ready(ov)
+    say(ov, "Tell me about a time you led a team?", utt=1)
+    assert pump(ov, lambda: drafted(ov))
+    assert body(ov) == "Listen first. Then ⚠ your example."
+    assert ov.gen_status.cget("text").endswith("llama-3.3-70b-versatile")
+    assert sent[0]["messages"][0]["role"] == "system" and "led a team" in sent[0]["messages"][1]["content"]
+    assert "Lead answer" in sent[0]["messages"][1]["content"] or "I led {{N}} people." in sent[0]["messages"][1]["content"]
 
 
 def test_stream_safe_hides_unfinished_markers(ov):
